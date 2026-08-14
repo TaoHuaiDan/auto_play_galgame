@@ -481,7 +481,7 @@ async def _windows_ocr_async(path: Path, language: str) -> dict[str, Any]:
         except (ImportError, ModuleNotFoundError) as exc:
             import_error = exc
     if modules is None:
-        message = "未安装 Windows OCR 的 PyWinRT 桥接包；可安装可选依赖 winsdk。"
+        message = "未安装 Windows OCR 的 PyWinRT 桥接包；请安装项目的 [windows-ocr] 可选依赖。"
         if import_error:
             message = f"{message} ({import_error})"
         return {
@@ -682,7 +682,7 @@ def ocr_image(image_path: str, language: str = "auto", psm: int = 6, timeout_sec
         "status": "missing_dependency" if not attempts else "error",
         "backend": "local",
         "text": "",
-        "message": "；".join(messages) or "未找到可用的本地 OCR 后端；可安装 winsdk 或 Tesseract。",
+        "message": "；".join(messages) or "未找到可用的本地 OCR 后端；可安装项目的 [windows-ocr] extra 或系统 Tesseract。",
         "image_path": str(path),
         "attempts": [{key: value for key, value in item.items() if key != "text"} for item in attempts],
     }

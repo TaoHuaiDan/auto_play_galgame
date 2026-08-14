@@ -1,1 +1,4 @@
+# Runtime dependencies are declared in pyproject.toml.
+# For the optional Windows OCR backend, use:
+#   py -3 -m pip install -e ".[windows-ocr]"
 mcp>=1.28.1,<2.0.0

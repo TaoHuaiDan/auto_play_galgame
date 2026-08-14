@@ -8,6 +8,8 @@
 
 当前版本优先完成了“文本处理与会话数据核心”，同时提供 Windows 全屏桌面截图、可选的完整窗口后台捕获、Windows 原生 OCR、窗口激活、按键和点击接口。截图始终是完整主屏或完整游戏窗口，不接受裁切区域，也不会把图片默认返回给 Codex。
 
+项目采用 MIT 许可证。当前仓库发布的是通用的 MCP 数据与工具接口；桌面捕获、窗口后台读取、键鼠输入和 Windows 原生 OCR 属于 Windows 平台后端。
+
 ## 安装
 
 在项目目录执行：
@@ -23,6 +25,14 @@ py -3 -m pip install -e ".[windows-ocr]"
 ```
 
 该可选依赖调用 Windows 自带 OCR，OCR 和文本解析均在本机完成；未安装时仍可使用手动记录，或显式 `include_image=true` 让 Codex 视觉兜底。
+
+开发和打包检查可以安装：
+
+```powershell
+py -3 -m pip install -e ".[dev,windows-ocr]"
+```
+
+`mcp` 依赖暂时限制在 1.x，是为了保持当前 `FastMCP` 接口兼容；迁移到 MCP SDK 2.x 后再放宽版本上限。Tesseract 只是可选的外部系统程序，不会随 Python 包自动安装。
 
 ## 连接 Codex
 
@@ -133,6 +143,12 @@ MCP 本身不包含一个外部大模型，因此“看图并决定路线”由�
 ## 开发检查
 
 ```powershell
+py -3 -m pip install -e ".[dev,windows-ocr]"
 py -3 -m compileall -q src
 py -3 -m unittest discover -s tests -v
+py -3 -m build
 ```
+
+## 许可证
+
+本项目使用 [MIT License](LICENSE)。项目不包含任何游戏本体、游戏资源、存档或截图；使用者需要自行确认目标游戏和相关数据的版权、隐私及自动化使用边界。
