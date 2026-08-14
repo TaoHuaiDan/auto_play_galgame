@@ -27,8 +27,8 @@ mcp = FastMCP(
     name="galgame-mcp",
     instructions=(
         "这是本地视觉小说自动游玩 MCP。默认 observe_game 在本机完成截图、OCR、文本解析和去重，只把 processed_text 与"
-        "必要状态返回给 Codex；原始截图/OCR 保存在会话目录。默认游戏全屏桌面捕获；若游戏在后台，使用"
-        "observe_game(capture_mode=window)，它捕获完整窗口而不是裁切。OCR 失败时才请求 include_image=true。"
+        "必要状态返回给 Codex；原始截图/OCR 保存在会话目录。已绑定窗口时默认使用完整窗口捕获，未绑定时使用全屏桌面捕获；"
+        "window 模式捕获完整窗口而不是裁切。OCR 失败时才请求 include_image=true。"
     ),
 )
 
@@ -247,9 +247,12 @@ def _capture_for_session(
     session_id: str | None = None,
 ) -> tuple[dict[str, Any], Path]:
     session = STORE.get_session(session_id=session_id)
-    mode = (capture_mode or "desktop").strip().lower()
-    if mode not in {"desktop", "window"}:
-        raise ValueError("capture_mode 必须是 desktop 或 window")
+    requested_mode = (capture_mode or "auto").strip().lower()
+    if requested_mode not in {"auto", "desktop", "window"}:
+        raise ValueError("capture_mode 必须是 auto、desktop 或 window")
+    mode = "window" if requested_mode == "auto" and window_title else requested_mode
+    if mode == "auto":
+        mode = "desktop"
     if mode == "window":
         if not window_title:
             raise ValueError("capture_mode=window 时必须提供 window_title 或先 attach_game")
@@ -414,7 +417,7 @@ def observe_game(
     language: str = "auto",
     include_image: bool = False,
     session_id: str | None = None,
-    capture_mode: str = "desktop",
+    capture_mode: str = "auto",
     focus_before_capture: bool | None = None,
     include_raw_text: bool = False,
 ) -> Any:
@@ -422,8 +425,9 @@ def observe_game(
 
     session = STORE.get_session(session_id=session_id)
     title = window_title or session.get("game", {}).get("window_title")
-    mode = (capture_mode or "desktop").strip().lower()
-    should_focus = mode != "window" if focus_before_capture is None else bool(focus_before_capture)
+    mode = (capture_mode or "auto").strip().lower()
+    uses_window = mode == "window" or (mode == "auto" and bool(title))
+    should_focus = not uses_window if focus_before_capture is None else bool(focus_before_capture)
     if title and should_focus:
         focused = native_focus_window(title)
         STORE.record_action("focus_window", {"title": title, **focused}, session_id=session["session_id"])
@@ -446,13 +450,13 @@ def observe_game(
 
 @mcp.tool(structured_output=False)
 def advance_game(
-    wait_seconds: float = 0.6,
+    wait_seconds: float = 0.15,
     ocr: bool = True,
     record_text: bool = True,
     language: str = "auto",
     include_image: bool = False,
     session_id: str | None = None,
-    capture_mode: str = "desktop",
+    capture_mode: str = "auto",
     include_raw_text: bool = False,
 ) -> Any:
     """用绑定的 advance_key 推进一段对白/动画，再返回新的截图。"""
@@ -466,7 +470,7 @@ def advance_game(
         focused = None
     control = game.get("control", {})
     key = control.get("advance_key") or "SPACE"
-    key_result = native_send_key(key=key, presses=1, interval_ms=80)
+    key_result = native_send_key(key=key, presses=1, interval_ms=0)
     duration = max(0.0, min(float(wait_seconds), 10.0))
     if duration:
         time.sleep(duration)
@@ -501,13 +505,13 @@ def select_choice(
     key: str | None = None,
     x: int | None = None,
     y: int | None = None,
-    wait_seconds: float = 0.6,
+    wait_seconds: float = 0.25,
     ocr: bool = True,
     record_text: bool = True,
     language: str = "auto",
     include_image: bool = False,
     session_id: str | None = None,
-    capture_mode: str = "desktop",
+    capture_mode: str = "auto",
     include_raw_text: bool = False,
 ) -> Any:
     """选择视觉小说选项；传 choice_id 会同步把对应记录标记为已选择。"""
@@ -528,16 +532,16 @@ def select_choice(
         "focus": focused,
     }
     if selected_mode == "number":
-        action_payload["input"] = native_send_key(str(option_index), presses=1, interval_ms=80)
+        action_payload["input"] = native_send_key(str(option_index), presses=1, interval_ms=0)
     elif selected_mode == "arrow":
-        native_send_key("HOME", presses=1, interval_ms=50)
+        native_send_key("HOME", presses=1, interval_ms=0)
         if option_index > 1:
-            native_send_key("DOWN", presses=option_index - 1, interval_ms=50)
-        action_payload["input"] = native_send_key("ENTER", presses=1, interval_ms=80)
+            native_send_key("DOWN", presses=option_index - 1, interval_ms=10)
+        action_payload["input"] = native_send_key("ENTER", presses=1, interval_ms=0)
     elif selected_mode == "key":
         if not key:
             raise ValueError("mode=key 时必须提供 key")
-        action_payload["input"] = native_send_key(key, presses=1, interval_ms=80)
+        action_payload["input"] = native_send_key(key, presses=1, interval_ms=0)
     elif selected_mode == "click":
         if x is None or y is None:
             raise ValueError("mode=click 时必须提供 x 和 y")

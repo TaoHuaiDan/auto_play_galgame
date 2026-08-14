@@ -29,14 +29,18 @@ def _png_chunk(kind: bytes, payload: bytes) -> bytes:
     )
 
 
-def _rgba_to_png(width: int, height: int, rgba: bytes) -> bytes:
+def _rgba_to_png(width: int, height: int, rgba: bytes | bytearray) -> bytes:
     row_size = width * 4
     raw = b"".join(b"\x00" + rgba[offset : offset + row_size] for offset in range(0, len(rgba), row_size))
     header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    try:
+        compression_level = max(0, min(9, int(os.environ.get("GALGAME_MCP_PNG_COMPRESSION", "1"))))
+    except ValueError:
+        compression_level = 1
     return (
         b"\x89PNG\r\n\x1a\n"
         + _png_chunk(b"IHDR", header)
-        + _png_chunk(b"IDAT", zlib.compress(raw, level=6))
+        + _png_chunk(b"IDAT", zlib.compress(raw, level=compression_level))
         + _png_chunk(b"IEND", b"")
     )
 
@@ -59,6 +63,20 @@ class _BitmapInfoHeader(ctypes.Structure):
 
 class _BitmapInfo(ctypes.Structure):
     _fields_ = [("bmiHeader", _BitmapInfoHeader), ("bmiColors", wintypes.DWORD * 3)]
+
+
+def _bgrx_to_rgba(bgrx: bytes) -> bytearray:
+    """Swap opaque BGRX channels in bulk without a Python per-pixel loop."""
+
+    if len(bgrx) % 4:
+        raise ValueError("BGRX buffer length must be divisible by four")
+    rgba = bytearray(bgrx)
+    red = rgba[2::4]
+    blue = rgba[0::4]
+    rgba[0::4] = red
+    rgba[2::4] = blue
+    rgba[3::4] = b"\xff" * (len(rgba) // 4)
+    return rgba
 
 
 def capture_screen_png() -> tuple[bytes, dict[str, int]]:
@@ -114,7 +132,7 @@ def capture_screen_png() -> tuple[bytes, dict[str, int]]:
         info.bmiHeader.biHeight = -capture_height  # top-down rows
         info.bmiHeader.biPlanes = 1
         info.bmiHeader.biBitCount = 32
-        info.bmiHeader.biCompression = 0  # BI_RGB
+        info.bmiHeader.biCompression = 0  # BI_RGB returns BGRX bytes
         buffer = ctypes.create_string_buffer(capture_width * capture_height * 4)
         copied = gdi32.GetDIBits(
             memory_dc,
@@ -128,12 +146,8 @@ def capture_screen_png() -> tuple[bytes, dict[str, int]]:
         if copied != capture_height:
             raise PlatformAutomationError("GetDIBits 屏幕读取失败")
 
-        bgra = buffer.raw[: capture_width * capture_height * 4]
-        rgba = bytearray(len(bgra))
-        for offset in range(0, len(bgra), 4):
-            blue, green, red, _reserved = bgra[offset : offset + 4]
-            rgba[offset : offset + 4] = bytes((red, green, blue, 255))
-        return _rgba_to_png(capture_width, capture_height, bytes(rgba)), {
+        rgba = _bgrx_to_rgba(buffer.raw[: capture_width * capture_height * 4])
+        return _rgba_to_png(capture_width, capture_height, rgba), {
             "x": left,
             "y": top,
             "width": capture_width,
@@ -205,7 +219,7 @@ def capture_window_png(title: str) -> tuple[bytes, dict[str, Any]]:
         info.bmiHeader.biHeight = -capture_height
         info.bmiHeader.biPlanes = 1
         info.bmiHeader.biBitCount = 32
-        info.bmiHeader.biCompression = 0
+        info.bmiHeader.biCompression = 0  # BI_RGB returns BGRX bytes
         buffer = ctypes.create_string_buffer(capture_width * capture_height * 4)
         copied = gdi32.GetDIBits(
             memory_dc,
@@ -218,12 +232,8 @@ def capture_window_png(title: str) -> tuple[bytes, dict[str, Any]]:
         )
         if copied != capture_height:
             raise PlatformAutomationError(f"无法读取窗口位图: {matched_title}")
-        bgra = buffer.raw[: capture_width * capture_height * 4]
-        rgba = bytearray(len(bgra))
-        for offset in range(0, len(bgra), 4):
-            blue, green, red, _reserved = bgra[offset : offset + 4]
-            rgba[offset : offset + 4] = bytes((red, green, blue, 255))
-        return _rgba_to_png(capture_width, capture_height, bytes(rgba)), {
+        rgba = _bgrx_to_rgba(buffer.raw[: capture_width * capture_height * 4])
+        return _rgba_to_png(capture_width, capture_height, rgba), {
             "x": int(rect.left),
             "y": int(rect.top),
             "width": capture_width,

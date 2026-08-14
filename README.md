@@ -34,6 +34,8 @@ py -3 -m pip install -e ".[dev,windows-ocr]"
 
 `mcp` 依赖暂时限制在 1.x，是为了保持当前 `FastMCP` 接口兼容；迁移到 MCP SDK 2.x 后再放宽版本上限。Tesseract 只是可选的外部系统程序，不会随 Python 包自动安装。
 
+为了提高连续游玩的响应速度，截图 PNG 默认使用低压缩级别；如果更在意会话截图占用的磁盘空间，可以设置 `GALGAME_MCP_PNG_COMPRESSION=6`，代价是每次捕获更慢。
+
 ## 连接 Codex
 
 官方 OpenAI 文档支持把本地 stdio MCP 配置在 `config.toml`，也支持用 `codex mcp add` 添加。安装本项目后，可以在本目录执行：
@@ -110,7 +112,7 @@ record_parsed_text(raw_text="...", screenshot_path="...")
 - 执行：`attach_game`、`focus_game_window`、`press_key`、`click_screen`、`wait`、`advance_game`、`select_choice`
 - 资源：`galgame://active/context`
 
-输入工具只操作当前 Windows 前台窗口；默认自动游玩策略先聚焦游戏，再读取完整全屏桌面。需要游戏留在后台时，使用 `observe_game(capture_mode="window", focus_before_capture=false)`，它捕获游戏自己的完整窗口，不裁切、不固定屏幕坐标。`PrintWindow` 对当前《千恋＊万花》实测可以读取被 Codex 窗口遮挡的画面；某些独占 GPU 或最小化游戏仍可能返回黑帧。`press_key` 和 `click_screen` 默认会把动作写入时间线。
+输入工具只操作当前 Windows 前台窗口；高层自动游玩工具默认使用 `capture_mode="auto"`：已绑定游戏窗口时读取完整窗口，未绑定时读取完整全屏桌面。需要强制桌面捕获时传 `capture_mode="desktop"`；需要游戏留在后台读取时可使用 `observe_game(capture_mode="window", focus_before_capture=false)`，它捕获游戏自己的完整窗口，不裁切、不固定屏幕坐标。`PrintWindow` 对当前《千恋＊万花》实测可以读取被 Codex 窗口遮挡的画面；某些独占 GPU 或最小化游戏仍可能返回黑帧。`press_key` 和 `click_screen` 默认会把动作写入时间线。
 
 更接近无人值守的通用流程是：
 
@@ -118,11 +120,13 @@ record_parsed_text(raw_text="...", screenshot_path="...")
 start_session(game_name="某视觉小说")
 attach_game(window_title="游戏窗口标题", advance_key="SPACE", choice_mode="number")
 observe_game()                   # 本地截图 + Windows OCR + 解析；默认只返回 processed_text
-get_codex_context()          # Codex 根据截图和上下文判断是否推进或选项
-advance_game()               # 普通对白
-select_choice(option_index=2, choice_id="choice_...")  # 选项；也支持 arrow/key/click 模式
+get_codex_context()             # Codex 根据截图和上下文判断是否推进或选项
+advance_game()                  # 普通对白；默认等待 0.15 秒
+select_choice(option_index=2, choice_id="choice_...")  # 选项；默认等待 0.25 秒
 observe_game()
 ```
+
+追求最快推进时可以传 `advance_game(wait_seconds=0)`；如果某个游戏的转场或文字动画还没有完成，再把等待调高到 `0.2`–`0.6` 秒。
 
 默认 `observe_game`、`advance_game` 和 `select_choice` 都会把截图留在会话目录，只向 Codex 返回 OCR 状态、`processed_text`、选项和必要动作结果；重复识别到同一对白时不会重复写入剧情事件。`get_codex_context` 和 `galgame://active/context` 默认返回精简上下文，不包含原始 OCR、截图内容或截图事件。只有 OCR 失败或确实需要视觉判断时，才显式传 `include_image=true`。
 

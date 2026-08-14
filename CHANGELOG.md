@@ -8,3 +8,7 @@
 - Added full-desktop capture and complete-window background capture on Windows.
 - Added local Windows OCR with compact processed text for MCP consumers.
 - Added an MIT license and initial open-source packaging metadata.
+- Optimized Windows capture with bulk channel conversion and fast PNG encoding;
+  bound games now use complete-window capture automatically.
+- Reduced default autoplay waits to 0.15 seconds for dialogue and 0.25 seconds
+  for choices, while keeping per-call wait overrides available.
