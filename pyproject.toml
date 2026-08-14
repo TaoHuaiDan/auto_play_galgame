@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "galgame-mcp"
+version = "0.1.0"
+description = "A local MCP server for playing visual novels and producing Codex-friendly structured story data."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.28.1,<2.0.0",
+]
+
+[project.optional-dependencies]
+windows-ocr = [
+    "winrt-Windows.Foundation>=3.2.1,<4.0.0",
+    "winrt-Windows.Foundation.Collections>=3.2.1,<4.0.0",
+    "winrt-Windows.Media.Ocr>=3.2.1,<4.0.0",
+    "winrt-Windows.Graphics.Imaging>=3.2.1,<4.0.0",
+    "winrt-Windows.Storage>=3.2.1,<4.0.0",
+    "winrt-Windows.Storage.Streams>=3.2.1,<4.0.0",
+    "winrt-Windows.Globalization>=3.2.1,<4.0.0",
+]
+
+[project.scripts]
+galgame-mcp = "galgame_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
