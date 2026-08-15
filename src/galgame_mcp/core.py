@@ -737,6 +737,7 @@ class SessionStore:
                     "choices": [],
                     "selected_choice_id": None,
                     "variables": {},
+                    "evidence": {},
                     "last_screenshot": None,
                 },
                 "timeline": [],
@@ -1566,15 +1567,16 @@ class SessionStore:
         choices: Sequence[str] | None = None,
         selected_index: int | None = None,
         screenshot_path: str | None = None,
-    source: str = "codex",
-    confidence: float | None = None,
-    noise_flags: Sequence[dict[str, Any]] | None = None,
-    note: str | None = None,
+        source: str = "codex",
+        confidence: float | None = None,
+        noise_flags: Sequence[dict[str, Any]] | None = None,
+        evidence: dict[str, Any] | None = None,
+        note: str | None = None,
         session_id: str | None = None,
     ) -> dict[str, Any]:
         if not any(
             value is not None and value != "" and value != []
-            for value in (raw_text, text, speaker, scene_id, location, choices, screenshot_path, note)
+            for value in (raw_text, text, speaker, scene_id, location, choices, screenshot_path, evidence, note)
         ):
             raise SessionError("observation 至少需要文本、场景、选项、截图或备注之一")
         normalised_noise_flags = _normalise_noise_flags(noise_flags)
@@ -1590,6 +1592,8 @@ class SessionStore:
             }
             if normalised_noise_flags:
                 observation_payload["noise_flags"] = copy.deepcopy(normalised_noise_flags)
+            if isinstance(evidence, dict):
+                observation_payload["evidence"] = copy.deepcopy(evidence)
             observation_event = self._append_event_locked(
                 session,
                 "observation",
@@ -1597,6 +1601,8 @@ class SessionStore:
             )
             event_ids.append(observation_event["event_id"])
             state = session["current_state"]
+            if isinstance(evidence, dict):
+                state["evidence"] = copy.deepcopy(evidence)
             if scene_id or location:
                 if scene_id:
                     state["scene_id"] = scene_id
@@ -1620,6 +1626,8 @@ class SessionStore:
                 }
                 if normalised_noise_flags:
                     payload["noise_flags"] = copy.deepcopy(normalised_noise_flags)
+                if isinstance(evidence, dict):
+                    payload["evidence"] = copy.deepcopy(evidence)
                 if confidence is not None:
                     payload["confidence"] = max(0.0, min(float(confidence), 1.0))
                 event = self._append_event_locked(session, "dialogue", payload)

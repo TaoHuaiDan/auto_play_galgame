@@ -177,6 +177,57 @@ class TimingProfileTests(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertEqual(result["timing"]["timeout_checks"], 1)
 
+    def test_play_stops_on_unknown_text_before_sending_advance(self) -> None:
+        session = {
+            "session_id": "test-session",
+            "game": {
+                "window_title": "测试游戏",
+                "control": {"advance_key": "SPACE"},
+                "timing_profile": {"strategy": "fixed", "stable_samples": 2},
+            },
+            "current_state": {},
+        }
+        payload = {
+            "capture_scope": "window_dialogue_region",
+            "image_path": "C:/frame.png",
+            "width": 600,
+            "height": 180,
+            "ocr": {"available": True},
+            "processed_text": {
+                "speaker": None,
+                "dialogue": "疑似新界面文字",
+                "choices": [],
+                "unknown_lines": ["疑似新界面文字"],
+                "text_status": "unknown",
+            },
+        }
+        actions: list[dict[str, object]] = []
+
+        with patch("galgame_mcp.server.STORE.get_session", return_value=session), patch(
+            "galgame_mcp.server._capture_processed_frame",
+            return_value=(payload, Path("C:/frame.png")),
+        ), patch(
+            "galgame_mcp.server._auto_return_from_settings",
+            side_effect=lambda current, *_args, **_kwargs: (current, Path("C:/frame.png")),
+        ), patch(
+            "galgame_mcp.server._advance_input_for_batch",
+            side_effect=AssertionError("unknown text must not advance"),
+        ), patch(
+            "galgame_mcp.server.STORE.record_action",
+            side_effect=lambda *_args, **kwargs: actions.append(kwargs) or {"event_id": "action-1"},
+        ):
+            result = server_play_until_choice(
+                max_steps=3,
+                wait_seconds=0,
+                record_text=False,
+                session_id="test-session",
+            )
+
+        if isinstance(result, list):
+            result = json.loads(result[0])
+        self.assertEqual(result["stop_reason"], "unknown_text_detected")
+        self.assertEqual(result["steps_advanced"], 0)
+        self.assertEqual(actions, [])
 
 class SettingsRecoveryTests(unittest.TestCase):
     def _arguments(self) -> dict[str, object]:

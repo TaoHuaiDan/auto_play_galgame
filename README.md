@@ -279,6 +279,8 @@ play_until_choice(max_steps=40, background=true, wait_seconds=0.05, transition_w
 
 该工具在 MCP 本地循环捕获、OCR、解析并保存每条对白，然后自动推进；出现真实游戏选项时才一次性返回 `batch` 和最终 `processed_text`。正常帧只读取底部对白框；如果推进后对白框暂时为空，会在 `transition_wait_seconds` 的有界时间内用递增短等待重试，期间不发送额外点击。等待结束后才对完整窗口做一次专门的选项 OCR，避免每帧扫描全屏，也避免在转场中误选。`max_batch_chars` 默认 6000，只统计对白和选项正文；达到上限会安全返回 `batch_char_limit`，Codex 可继续调用，不会把过长路线一次塞进上下文。设置页会尝试点击明确的“回到游戏/返回游戏”，OCR 空帧、未识别对白、选项未出现或达到 `max_steps` 时会安全停止，不会无限点击；如果因 `dialogue_not_detected` 或 `ocr_unavailable` 停止，会自动附带最后一张完整窗口图并标记 `manual_intervention.required=true`，让 Codex 读图后用 `record_observation` 或一次 `advance_game` 接管。中间正常帧不会逐次传给 Codex，因此适合连续无人值守游玩。
 
+每次本地解析还会附带精简的 `evidence`：`channels` 分开表示 `dialogue`、`speaker`、`choice`、`system_ui`、`unknown_text` 和转场状态，`safe_to_advance=false` 时不会把未知文字当作普通对白继续推进。`ui_lines` 记录 `SAVE/LOAD/VOICE` 等残留，`unknown_lines` 记录无法按当前布局确认的文字；它们不会从原始 OCR 中删除。`unknown_text_detected` 是需要 Codex 接管的安全停机原因。对白会生成稳定的 `episode_id`，便于跨帧去重和后续压缩；只有姓名框的旧版兼容路径仍可推进，因为部分引擎会把省略号等极短对白漏给 OCR。
+
 如果默认队列方式没有推进，可改用直接窗口过程方式：
 
 ```text

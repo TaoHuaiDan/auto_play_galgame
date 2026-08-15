@@ -16,6 +16,80 @@ _NOISE = re.compile(r"^\s*(?:[-_=~·•]{3,}|>>+|skip|auto|save|load)\s*$", re.I
 _DIALOGUE_CHAR = r"\u2e80-\u9fff\u3040-\u30ff\ua960-\ua97f，。！？、；：,.!?"
 _BETWEEN_DIALOGUE_CHAR_SPACE = re.compile(rf"(?<=[{_DIALOGUE_CHAR}])[ \t]+(?=[{_DIALOGUE_CHAR}])")
 _OCR_SYMBOL = re.compile(rf"[{_DIALOGUE_CHAR}A-Za-z0-9]", re.UNICODE)
+_UI_WORDS = {
+    "auto",
+    "back",
+    "config",
+    "language",
+    "load",
+    "menu",
+    "next",
+    "qload",
+    "qsave",
+    "return",
+    "save",
+    "skip",
+    "system",
+    "voice",
+}
+_STORY_PUNCTUATION = "。！？；：，、,.!?;:"
+
+
+def _looks_like_ui_residue(
+    line: str,
+    layout_profile: dict[str, Any] | None = None,
+) -> bool:
+    """Recognize short control/name residue without naming one game glyph.
+
+    Full-window OCR frequently returns labels such as ``SAVE LOAD`` or a
+    short mixed ASCII/digit string from a name/status icon.  They are not
+    rejected as story text merely because they are short: configured speaker
+    or dialogue markers and explicit choice prefixes always win.
+    """
+
+    stripped = str(line or "").strip()
+    if not stripped:
+        return False
+    marker_openers, _ = _marker_tokens(layout_profile)
+    if any(stripped.startswith(marker) for marker in marker_openers):
+        return False
+    if re.match(r"^\s*(?:[-*•]\s+|\d{1,2}\s*[.)、:：])", stripped):
+        return False
+    compact = _compact_ocr_text(stripped).casefold()
+    if not compact:
+        return False
+    # Keep punctuation as a separator when counting controls.  Compacting
+    # first would merge ``SAVE LOAD Q.SAVE`` into ``saveloadq.save`` and hide
+    # the individual UI tokens from the classifier.
+    words = re.findall(r"[a-z]+", stripped.casefold())
+    cjk_count = len(re.findall(r"[\u2e80-\u9fff\u3040-\u30ff\ua960-\ua97f]", compact))
+    ui_hits = sum(1 for word in words if word in _UI_WORDS)
+    if ui_hits >= 2 and cjk_count <= 3:
+        return True
+    if any(char in stripped for char in _STORY_PUNCTUATION + "「『【《〈"):
+        return False
+    if ui_hits >= 1 and len(compact) <= 24 and cjk_count <= 2:
+        return True
+    # Conservative fallback for mixed short OCR fragments such as ``Levy9``
+    # or ``V创0``.  Do not classify a plain short English sentence such as
+    # ``yes`` as UI: that is a legitimate line in another visual novel.
+    mixed_fragment = bool(re.search(r"\d", compact) or cjk_count and words)
+    return bool(words and mixed_fragment and len(compact) <= 14 and cjk_count <= 2)
+
+
+def looks_like_ui_residue(
+    line: str,
+    layout_profile: dict[str, Any] | None = None,
+) -> bool:
+    """Public conservative UI-residue check shared by capture and parsing.
+
+    Keeping this small classifier in the text module makes the fast-capture
+    path use the same safety decision as the structured parser.  It is still
+    intentionally conservative: an ambiguous short fragment is rejected as
+    a reason to trust a crop, never deleted from the raw OCR record.
+    """
+
+    return _looks_like_ui_residue(line, layout_profile)
 
 
 def _marker_specs(profile: dict[str, Any] | None, key: str) -> list[dict[str, Any]]:
@@ -166,6 +240,9 @@ def _ocr_noise_flags(
             code = "replacement_character"
             severity = "high"
             reason = "OCR contains a replacement or NUL character"
+        elif _looks_like_ui_residue(line, layout_profile):
+            code = "ui_residue"
+            reason = "short control, status, or name-like OCR residue is not treated as story text"
         elif _BETWEEN_DIALOGUE_CHAR_SPACE.search(line):
             code = "spacing_artifact"
             reason = "spaces occur between adjacent dialogue characters"
@@ -489,6 +566,8 @@ def parse_screen_text(
     choice_records: list[dict[str, Any]] = []
     dialogue_lines: list[str] = []
     unparsed_lines: list[str] = []
+    ui_lines: list[str] = []
+    unknown_lines: list[str] = []
     speaker: str | None = None
     explicit_speaker = False
     profile = layout_profile if isinstance(layout_profile, dict) else {}
@@ -527,6 +606,10 @@ def parse_screen_text(
             )
             continue
 
+        if _looks_like_ui_residue(line, profile):
+            ui_lines.append(line)
+            continue
+
         if speaker is None:
             layout_name = _layout_name_label(
                 line,
@@ -558,6 +641,7 @@ def parse_screen_text(
 
         if _starts_with_marker(line, speaker_markers) and not explicit_speaker:
             unparsed_lines.append(line)
+            unknown_lines.append(line)
         else:
             dialogue_lines.append(line)
 
@@ -576,6 +660,16 @@ def parse_screen_text(
     else:
         confidence = 0.0
     screen_type = detect_screen_type(raw_text)
+    if choices:
+        text_status = "choice"
+    elif dialogue:
+        text_status = "recognized"
+    elif unknown_lines:
+        text_status = "unknown"
+    elif ui_lines:
+        text_status = "ui_only"
+    else:
+        text_status = "empty"
     return {
         "raw_text": raw_text,
         "clean_text": "\n".join(lines),
@@ -584,8 +678,11 @@ def parse_screen_text(
         "choices": choices,
         "choice_records": choice_records,
         "unparsed_lines": unparsed_lines,
+        "ui_lines": ui_lines,
+        "unknown_lines": unknown_lines,
         "line_count": len(lines),
         "confidence": confidence,
         "screen_type": screen_type,
+        "text_status": text_status,
         "noise_flags": noise_flags,
     }

@@ -15,6 +15,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP, Image
 
 from .core import SCHEMA_VERSION, SessionStore, new_id, utc_now
+from .evidence import TextEpisodeTracker, build_frame_evidence
 from .platform import (
     PlatformAutomationError,
     capture_screen_png,
@@ -31,7 +32,7 @@ from .platform import (
     send_key as native_send_key,
     touch_screen as native_touch_screen,
 )
-from .text import detect_screen_type, parse_screen_text
+from .text import detect_screen_type, looks_like_ui_residue, parse_screen_text
 
 
 STORE = SessionStore()
@@ -195,6 +196,8 @@ def _usable_story_text(value: Any) -> bool:
     compact = re.sub(r"\s+", "", str(value or ""))
     if not compact:
         return False
+    if looks_like_ui_residue(compact):
+        return False
     normalized = re.sub(r"[^\w]+", "", compact, flags=re.UNICODE).casefold()
     if not normalized or normalized in _OCR_UI_ONLY_TOKENS:
         return False
@@ -315,6 +318,7 @@ def record_observation(
     source: str = "codex",
     confidence: float | None = None,
     noise_flags: list[dict[str, Any]] | None = None,
+    evidence: dict[str, Any] | None = None,
     note: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
@@ -332,6 +336,7 @@ def record_observation(
         source=source,
         confidence=confidence,
         noise_flags=noise_flags,
+        evidence=evidence,
         note=note,
         session_id=session_id,
     )
@@ -363,9 +368,15 @@ def record_parsed_text(
 
     profile = layout_profile if layout_profile is not None else _session_layout_profile(session_id)
     parsed = parse_screen_text(raw_text, layout_profile=profile)
+    evidence = build_frame_evidence(
+        parsed,
+        screen_type=parsed.get("screen_type"),
+        ocr_available=True,
+    )
     if parsed.get("screen_type") == "settings":
         return {
             "parsed": _public_parsed_text(parsed),
+            "evidence": evidence,
             "recorded": False,
             "message": "识别为设置/系统菜单，未将控件记录为剧情对白或选项",
         }
@@ -374,6 +385,7 @@ def record_parsed_text(
     if not dialogue and not choices:
         return {
             "parsed": _public_parsed_text(parsed),
+            "evidence": evidence,
             "recorded": False,
             "message": "没有识别到可记录的对白或选项",
         }
@@ -388,10 +400,12 @@ def record_parsed_text(
         source=source,
         confidence=parsed.get("confidence"),
         noise_flags=parsed.get("noise_flags"),
+        evidence=evidence,
         session_id=session_id,
     )
     return {
         "parsed": _public_parsed_text(parsed),
+        "evidence": evidence,
         "recorded": {
             "observation_id": recorded.get("observation_id"),
             "event_ids": recorded.get("event_ids", []),
@@ -628,6 +642,9 @@ def _public_parsed_text(parsed: dict[str, Any]) -> dict[str, Any]:
         "confidence": parsed.get("confidence", 0.0),
         "noise_flags": copy.deepcopy(parsed.get("noise_flags") or []),
     }
+    for key in ("ui_lines", "unknown_lines", "text_status"):
+        if parsed.get(key):
+            public[key] = copy.deepcopy(parsed[key])
     if parsed.get("screen_type"):
         public["screen_type"] = parsed["screen_type"]
     return public
@@ -1256,6 +1273,10 @@ def _fast_capture_has_text(payload: dict[str, Any]) -> bool:
     processed = payload.get("processed_text") or {}
     if list(processed.get("choices") or []):
         return True
+    if processed.get("text_status") in {"empty", "ui_only", "unknown"}:
+        return False
+    if list(processed.get("unknown_lines") or []):
+        return False
     # Speaker-only frames and UI residue (VOICE/AUTO/000) are deliberately
     # treated as a miss.  The full-window OCR can recover the line or confirm
     # that the game is actually in a transition.
@@ -1560,6 +1581,12 @@ def _batch_dialogue_item(payload: dict[str, Any], index: int) -> dict[str, Any] 
         item["choice_records"] = parsed["choice_records"]
     if parsed.get("screen_type"):
         item["screen_type"] = parsed["screen_type"]
+    if parsed.get("text_status"):
+        item["text_status"] = parsed["text_status"]
+    evidence = payload.get("evidence") or {}
+    current_episode = evidence.get("current_episode") if isinstance(evidence, dict) else None
+    if isinstance(current_episode, dict) and current_episode.get("episode_id"):
+        item["episode_id"] = current_episode["episode_id"]
     return item
 
 
@@ -1785,6 +1812,11 @@ def _process_local_text(
         parsed = full_parsed
         source_result = full_ocr_result
     if parsed is None:
+        payload["evidence"] = build_frame_evidence(
+            {},
+            screen_type=full_screen_type,
+            ocr_available=bool((payload.get("ocr") or {}).get("available")),
+        )
         return payload
     if full_parsed and full_parsed.get("choices"):
         parsed["choices"] = list(full_parsed.get("choices") or [])
@@ -1799,6 +1831,11 @@ def _process_local_text(
         public_parsed["screen_type"] = screen_type
         payload["screen_type"] = screen_type
     payload["processed_text"] = public_parsed
+    payload["evidence"] = build_frame_evidence(
+        public_parsed,
+        screen_type=screen_type,
+        ocr_available=bool((payload.get("ocr") or {}).get("available")),
+    )
     # Settings controls are not story choices. Keep the screenshot and OCR
     # result, but do not pollute the route timeline with fake dialogue/options.
     if screen_type == "settings":
@@ -1818,6 +1855,7 @@ def _process_local_text(
         source=source_result.get("backend") or "local_ocr",
         confidence=parsed.get("confidence"),
         noise_flags=parsed.get("noise_flags"),
+        evidence=payload.get("evidence"),
         session_id=session["session_id"],
     )
     payload["recorded"] = {
@@ -2731,6 +2769,7 @@ def play_until_choice(
     pending_settle_before: dict[str, Any] | None = None
     timing_waits: list[dict[str, Any]] = []
     timing_settle_failed = False
+    episode_tracker = TextEpisodeTracker(stable_samples=timing["stable_samples"])
     # A malformed OCR frame must never turn max_steps into an unbounded
     # capture loop.  In the normal path this leaves several attempts per
     # requested advance for transition settling and one full-window choice
@@ -2883,6 +2922,20 @@ def play_until_choice(
             stop_reason = "choice_detected"
             break
 
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, dict):
+            evidence = build_frame_evidence(
+                parsed,
+                screen_type=payload.get("screen_type"),
+                ocr_available=bool((payload.get("ocr") or {}).get("available")),
+            )
+            payload["evidence"] = evidence
+        if "unknown_text" in (evidence.get("blocking_reasons") or []):
+            # Unknown text is different from a blank transition: it may be a
+            # new choice or story UI.  Escalate to Codex instead of treating
+            # it as dialogue and sending a potentially unsafe click.
+            stop_reason = "unknown_text_detected"
+            break
         # A zero-step call is still allowed to return the current frame, but
         # it must never enter the blank-frame retry loop and accidentally
         # advance the game.
@@ -2990,6 +3043,16 @@ def play_until_choice(
         transition_started_at = None
         transition_retry_index = 0
         transition_probe_attempts = 0
+        dialogue_text = str(item.get("dialogue") or "").strip()
+        if dialogue_text:
+            episode = episode_tracker.observe(
+                dialogue_text,
+                channel="dialogue",
+                recognized=True,
+                confidence=item.get("confidence"),
+            )
+            if episode:
+                item["episode"] = episode
         item_key = (
             str(item.get("speaker") or "旁白"),
             str(item.get("dialogue") or ""),
@@ -3099,6 +3162,7 @@ def play_until_choice(
             "ocr_fallback",
             "ocr",
             "processed_text",
+            "evidence",
             "screen_type",
             "auto_recovery",
         ):
@@ -3159,6 +3223,7 @@ def play_until_choice(
         "dialogue_not_detected",
         "ocr_unavailable",
         "timing_settle_timeout",
+        "unknown_text_detected",
     }
     if manual_intervention:
         response["manual_intervention"] = {
@@ -3166,7 +3231,11 @@ def play_until_choice(
             "reason": (
                 "timing_settle_timeout"
                 if stop_reason == "timing_settle_timeout"
-                else "ocr_frame_empty"
+                else (
+                    "unknown_text_detected"
+                    if stop_reason == "unknown_text_detected"
+                    else "ocr_frame_empty"
+                )
             ),
             "image_path": str(final_image_path) if final_image_path is not None else None,
         }
@@ -3484,6 +3553,8 @@ def ocr_image(
     response = _compact_ocr_result(result)
     response["image_path"] = result.get("image_path") or str(Path(image_path).expanduser().resolve())
     profile = layout_profile if layout_profile is not None else _session_layout_profile(session_id)
+    parsed: dict[str, Any] | None = None
+    evidence: dict[str, Any]
     if raw_text:
         parsed = parse_screen_text(
             raw_text,
@@ -3492,15 +3563,21 @@ def ocr_image(
             layout_profile=profile,
         )
         response["processed_text"] = _public_parsed_text(parsed)
+        evidence = build_frame_evidence(
+            parsed,
+            screen_type=parsed.get("screen_type"),
+            ocr_available=bool(result.get("available")),
+        )
         if include_raw_text:
             response["raw_text"] = raw_text
-    if record and raw_text:
-        parsed = parse_screen_text(
-            raw_text,
-            regions=result.get("regions") or [],
-            image_size=(image_width, image_height) if image_width and image_height else None,
-            layout_profile=profile,
+    else:
+        evidence = build_frame_evidence(
+            {},
+            ocr_available=bool(result.get("available")),
         )
+    response["evidence"] = evidence
+    if record and raw_text:
+        assert parsed is not None
         observation = STORE.record_observation(
             raw_text=raw_text,
             text=parsed.get("dialogue") or None,
@@ -3510,6 +3587,7 @@ def ocr_image(
             source=result.get("backend") or "local_ocr",
             confidence=parsed.get("confidence"),
             noise_flags=parsed.get("noise_flags"),
+            evidence=evidence,
             session_id=session_id,
         )
         response["recorded_observation"] = {
