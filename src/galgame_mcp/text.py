@@ -35,6 +35,44 @@ _UI_WORDS = {
 _STORY_PUNCTUATION = "。！？；：，、,.!?;:"
 
 
+def _within_edit_distance(left: str, right: str, limit: int = 2) -> bool:
+    """Return whether two short OCR tokens are within a tiny edit budget."""
+
+    if abs(len(left) - len(right)) > limit:
+        return False
+    previous = list(range(len(right) + 1))
+    for left_index, left_char in enumerate(left, start=1):
+        current = [left_index]
+        for right_index, right_char in enumerate(right, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[right_index] + 1,
+                    previous[right_index - 1] + (left_char != right_char),
+                )
+            )
+        if min(current) > limit:
+            return False
+        previous = current
+    return previous[-1] <= limit
+
+
+def _looks_like_ui_token(token: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(token or "").casefold())
+    if not normalized:
+        return False
+    if normalized in _UI_WORDS:
+        return True
+    # OCR often turns VOICE into variants such as ``VOlCf`` or ``VO'CE``.
+    # Require the same two-character prefix before allowing a fuzzy match, so
+    # ordinary short English dialogue is not swallowed by the UI filter.
+    for word in _UI_WORDS:
+        if len(normalized) >= 4 and normalized[:2] == word[:2]:
+            if _within_edit_distance(normalized, word, limit=2):
+                return True
+    return False
+
+
 def _looks_like_ui_residue(
     line: str,
     layout_profile: dict[str, Any] | None = None,
@@ -62,8 +100,14 @@ def _looks_like_ui_residue(
     # first would merge ``SAVE LOAD Q.SAVE`` into ``saveloadq.save`` and hide
     # the individual UI tokens from the classifier.
     words = re.findall(r"[a-z]+", stripped.casefold())
-    cjk_count = len(re.findall(r"[\u2e80-\u9fff\u3040-\u30ff\ua960-\ua97f]", compact))
-    ui_hits = sum(1 for word in words if word in _UI_WORDS)
+    # Count script characters, not the CJK punctuation block.  OCR residue
+    # often contains brackets such as ``《》``; counting those as CJK would
+    # hide an otherwise obvious ``SAVE/LOAD`` control cluster.
+    cjk_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\ua960-\ua97f]", compact))
+    ui_hits = sum(1 for word in words if _looks_like_ui_token(word))
+    compact_letters = re.sub(r"[^a-z0-9]", "", stripped.casefold())
+    if _looks_like_ui_token(compact_letters):
+        ui_hits = max(ui_hits, 1)
     if ui_hits >= 2 and cjk_count <= 3:
         return True
     if any(char in stripped for char in _STORY_PUNCTUATION + "「『【《〈"):
@@ -73,6 +117,8 @@ def _looks_like_ui_residue(
     # Conservative fallback for mixed short OCR fragments such as ``Levy9``
     # or ``V创0``.  Do not classify a plain short English sentence such as
     # ``yes`` as UI: that is a legitimate line in another visual novel.
+    if re.fullmatch(r"\d{2,}", compact):
+        return True
     mixed_fragment = bool(re.search(r"\d", compact) or cjk_count and words)
     return bool(words and mixed_fragment and len(compact) <= 14 and cjk_count <= 2)
 

@@ -188,11 +188,26 @@ class TextParserTests(unittest.TestCase):
         self.assertEqual(parsed["speaker"], "老人")
 
     def test_filters_short_ui_residue_without_deleting_raw_text(self) -> None:
-        parsed = parse_screen_text("SAVE LOAD Q.SAVE Q.LOAD\nVOICE\nV创0")
+        parsed = parse_screen_text(
+            "SAVE LOAD Q.SAVE Q.LOAD\nVOICE\nV创0\n"
+            "SAVE LOAD Q.SAVE Q.LOAD SYSTEM 《，》 > 羽《，； 0 ×\n"
+            "VOlCf\nVO'CE\n00000"
+        )
 
         self.assertEqual(parsed["dialogue"], "")
         self.assertEqual(parsed["text_status"], "ui_only")
-        self.assertEqual(parsed["ui_lines"], ["SAVE LOAD Q.SAVE Q.LOAD", "VOICE", "V创0"])
+        self.assertEqual(
+            parsed["ui_lines"],
+            [
+                "SAVE LOAD Q.SAVE Q.LOAD",
+                "VOICE",
+                "V创0",
+                "SAVE LOAD Q.SAVE Q.LOAD SYSTEM 《，》 > 羽《，； 0 ×",
+                "VOlCf",
+                "VO'CE",
+                "00000",
+            ],
+        )
         self.assertIn("SAVE LOAD", parsed["raw_text"])
 
     def test_keeps_short_story_marker_out_of_ui_residue_filter(self) -> None:
