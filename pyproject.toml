@@ -43,6 +43,9 @@ windows-ocr = [
     "winrt-Windows.Storage.Streams>=3.2.1,<4.0.0; platform_system == 'Windows'",
     "winrt-Windows.Globalization>=3.2.1,<4.0.0; platform_system == 'Windows'",
 ]
+ocr-focus = [
+    "Pillow>=10,<13",
+]
 dev = [
     "build>=1.2,<2.0",
     "pytest>=8.0,<9.0",

@@ -16,6 +16,8 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+from .ocr_focus import map_zoomed_ocr_result, pillow_available, temporary_zoomed_regions
+
 
 class PlatformAutomationError(RuntimeError):
     """Raised when a local screen/input operation is unavailable or fails."""
@@ -103,6 +105,48 @@ def _rgba_to_png(width: int, height: int, rgba: bytes | bytearray) -> bytes:
         + _png_chunk(b"IDAT", zlib.compress(raw, level=compression_level))
         + _png_chunk(b"IEND", b"")
     )
+
+
+def image_motion_score(
+    first_image_path: str | Path,
+    second_image_path: str | Path,
+    *,
+    max_width: int = 160,
+) -> float | None:
+    """Return a small grayscale difference score for two local PNG frames.
+
+    This is intentionally a coarse signal for transition detection, not a
+    replacement for OCR or visual understanding.  Pillow is optional; when
+    it is unavailable, callers receive ``None`` and must keep the safe
+    no-extra-click path.
+    """
+
+    if not pillow_available():
+        return None
+    try:
+        from PIL import Image, ImageChops, ImageStat
+
+        width_limit = max(32, min(int(max_width), 640))
+        with Image.open(first_image_path) as first_source:
+            first = first_source.convert("L")
+        with Image.open(second_image_path) as second_source:
+            second = second_source.convert("L")
+        if first.size != second.size or first.width <= 0 or first.height <= 0:
+            return None
+        scale = min(1.0, width_limit / float(first.width))
+        size = (
+            max(1, round(first.width * scale)),
+            max(1, round(first.height * scale)),
+        )
+        resampling = getattr(Image, "Resampling", Image).BILINEAR
+        if first.size != size:
+            first = first.resize(size, resampling)
+            second = second.resize(size, resampling)
+        difference = ImageChops.difference(first, second)
+        mean = float(ImageStat.Stat(difference).mean[0]) / 255.0
+        return round(max(0.0, min(mean, 1.0)), 6)
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 class _BitmapInfoHeader(ctypes.Structure):
@@ -1488,4 +1532,104 @@ def ocr_image(image_path: str, language: str = "auto", psm: int = 6, timeout_sec
         "message": "；".join(messages) or "未找到可用的本地 OCR 后端；可安装项目的 [windows-ocr] extra 或系统 Tesseract。",
         "image_path": str(path),
         "attempts": [{key: value for key, value in item.items() if key != "text"} for item in attempts],
+    }
+
+
+def focused_ocr_image(
+    image_path: str,
+    regions: list[dict[str, Any]],
+    *,
+    language: str = "auto",
+    psm: int = 6,
+    timeout_sec: int = 12,
+    scale: float = 2.0,
+) -> dict[str, Any]:
+    """Run one enlarged OCR pass over caller-supplied layout regions.
+
+    This is intentionally a narrow fallback after normal OCR. It never
+    searches for regions or applies pixel enhancement; each configured region
+    is cropped and enlarged once, then sent to the existing OCR backend.
+    """
+
+    source = Path(image_path).expanduser().resolve()
+    if not source.exists():
+        raise PlatformAutomationError(f"找不到图片: {source}")
+    if not pillow_available():
+        return {
+            "available": False,
+            "status": "missing_dependency",
+            "backend": "ocr_focus",
+            "text": "",
+            "message": "区域放大 OCR 需要 Pillow；可安装项目的 [ocr-focus] 可选依赖。",
+            "image_path": str(source),
+        }
+
+    attempts: list[dict[str, Any]] = []
+    valid_regions = [item for item in regions if isinstance(item, dict)]
+    per_attempt_timeout = max(
+        2,
+        min(8, int(timeout_sec) // max(1, len(valid_regions))),
+    )
+    with temporary_zoomed_regions(source, valid_regions, scale=scale) as variants:
+        for variant in variants:
+            result = ocr_image(
+                str(variant["path"]),
+                language=language,
+                psm=psm,
+                timeout_sec=per_attempt_timeout,
+            )
+            mapped = map_zoomed_ocr_result(result, variant, source_path=source)
+            attempts.append(
+                {
+                    "region_index": variant.get("region_index"),
+                    "label": variant.get("label"),
+                    "status": mapped.get("status"),
+                    "backend": mapped.get("backend"),
+                    "char_count": len(str(mapped.get("text") or "")),
+                    "result": mapped,
+                }
+            )
+
+    selected_regions: list[dict[str, Any]] = []
+    fallback_text: list[str] = []
+    seen: set[str] = set()
+    for attempt in attempts:
+        result = attempt["result"]
+        text = str(result.get("text") or "").strip()
+        if text:
+            key = " ".join(text.split()).casefold()
+            if key not in seen:
+                seen.add(key)
+                fallback_text.append(text)
+        for item in result.get("regions") or []:
+            item_text = str(item.get("text") or "").strip()
+            if not item_text:
+                continue
+            key = " ".join(item_text.split()).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            selected_regions.append(dict(item))
+    selected_regions.sort(
+        key=lambda item: (float(item.get("y", 0)), float(item.get("x", 0)))
+    )
+    merged_text = "\n".join(
+        str(item.get("text") or "").strip()
+        for item in selected_regions
+        if str(item.get("text") or "").strip()
+    )
+    if not merged_text:
+        merged_text = "\n".join(fallback_text)
+    return {
+        "available": any(bool(attempt["result"].get("available")) for attempt in attempts),
+        "status": "ok" if merged_text else "empty",
+        "backend": "focused_ocr",
+        "text": merged_text,
+        "regions": selected_regions,
+        "image_path": str(source),
+        "scale": max(1.5, min(float(scale), 4.0)),
+        "attempts": [
+            {key: value for key, value in attempt.items() if key != "result"}
+            for attempt in attempts
+        ],
     }

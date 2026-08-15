@@ -119,6 +119,16 @@ def _looks_like_ui_residue(
     # ``yes`` as UI: that is a legitimate line in another visual novel.
     if re.fullmatch(r"\d{2,}", compact):
         return True
+    # A dialogue crop can turn a short punctuation line into a digit/symbol
+    # cluster such as ``000 00 |`` or ``0 ×``.  With no letters/CJK and no
+    # story punctuation, this is safer to classify as UI/OCR residue so the
+    # caller can run its full-frame/focused fallback instead of advancing on
+    # a false positive.  Marker-prefixed lines already returned above remain
+    # eligible for legitimate punctuation-only dialogue.
+    if re.search(r"\d", compact) and not re.search(
+        r"[A-Za-z\u2e80-\u9fff\u3040-\u30ff\ua960-\ua97f]", compact
+    ) and not re.search(rf"[{_STORY_PUNCTUATION}]", compact):
+        return True
     mixed_fragment = bool(re.search(r"\d", compact) or cjk_count and words)
     return bool(words and mixed_fragment and len(compact) <= 14 and cjk_count <= 2)
 

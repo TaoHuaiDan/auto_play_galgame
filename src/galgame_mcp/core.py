@@ -243,11 +243,13 @@ def _normalise_timing_profile(profile: Any) -> dict[str, Any]:
     aliases = {"fixed", "text_hash", "hash", "hash_stable", "adaptive"}
     if strategy not in aliases:
         raise SessionError("timing_profile.strategy 必须是 fixed 或 text_hash")
-    copied["strategy"] = "text_hash" if strategy in {"hash", "hash_stable", "adaptive"} else "fixed"
+    copied["strategy"] = "text_hash" if strategy in {"text_hash", "hash", "hash_stable", "adaptive"} else "fixed"
 
     float_limits = {
         "post_click_wait_seconds": (0.0, 10.0),
         "transition_wait_seconds": (0.0, 10.0),
+        "transition_accelerate_delay_seconds": (0.1, 3.0),
+        "transition_probe_interval_seconds": (0.05, 2.0),
         "settle_timeout_seconds": (0.0, 30.0),
         "settle_poll_seconds": (0.02, 2.0),
     }
@@ -272,6 +274,8 @@ def _normalise_timing_profile(profile: Any) -> dict[str, Any]:
         copied["stable_samples"] = samples
     if "require_text_change" in copied and not isinstance(copied["require_text_change"], bool):
         raise SessionError("timing_profile.require_text_change 必须是布尔值")
+    if "transition_accelerate" in copied and not isinstance(copied["transition_accelerate"], bool):
+        raise SessionError("timing_profile.transition_accelerate 必须是布尔值")
     return copied
 
 
@@ -348,7 +352,12 @@ class SessionStore:
         compaction_threshold_bytes: int | None = None,
         compaction_keep_recent_events: int | None = None,
     ):
-        configured_root = root or os.environ.get("GALGAME_MCP_DATA_DIR")
+        if root is not None:
+            configured_root = root
+            self.root_source = "argument"
+        else:
+            configured_root = os.environ.get("GALGAME_MCP_DATA_DIR")
+            self.root_source = "environment" if configured_root else "cwd_default"
         self.root = Path(configured_root or (Path.cwd() / ".galgame_sessions")).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self._active_file = self.root / "active_session.txt"
@@ -368,6 +377,16 @@ class SessionStore:
             if compaction_keep_recent_events is not None
             else os.environ.get("GALGAME_MCP_COMPACTION_KEEP_RECENT_EVENTS", 24)
         )
+
+    def storage_info(self) -> dict[str, Any]:
+        """Return the resolved data directory and how it was selected."""
+
+        return {
+            "data_dir": str(self.root),
+            "source": self.root_source,
+            "default_data_dir": str((Path.cwd() / ".galgame_sessions").resolve()),
+            "active_session_pointer": str(self._active_file),
+        }
 
     @staticmethod
     def _bounded_compaction_threshold(value: Any) -> int:
@@ -610,6 +629,97 @@ class SessionStore:
                 "journal_needs_seed": False,
             }
         )
+
+    @staticmethod
+    def _collect_image_path_strings(value: Any, result: set[str] | None = None) -> set[str]:
+        """Collect image-like paths without treating arbitrary text as files."""
+
+        paths = result if result is not None else set()
+        if isinstance(value, dict):
+            for item in value.values():
+                SessionStore._collect_image_path_strings(item, paths)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                SessionStore._collect_image_path_strings(item, paths)
+        elif isinstance(value, str):
+            lowered = value.lower().split("?", 1)[0]
+            if lowered.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                paths.add(value)
+        return paths
+
+    def _resolve_frame_artifact_locked(self, session: dict[str, Any], raw_path: str) -> Path | None:
+        """Resolve a recorded image only if it stays inside this session's frames."""
+
+        session_directory = self.session_dir(session["session_id"]).resolve()
+        frames_directory = (session_directory / "frames").resolve()
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = session_directory / candidate
+        resolved = candidate.resolve(strict=False)
+        try:
+            resolved.relative_to(frames_directory)
+        except ValueError:
+            return None
+        if resolved.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+            return None
+        return resolved
+
+    def _purge_unreferenced_frame_artifacts_locked(
+        self,
+        session: dict[str, Any],
+        *,
+        protected_values: Iterable[Any] = (),
+    ) -> dict[str, Any]:
+        """Delete raw frame files no longer referenced by active session data.
+
+        Compaction removes the raw JSON event prefix first. This second pass
+        reclaims the screenshots produced for that prefix, while retaining
+        screenshots referenced by the remaining raw tail, current state, or a
+        validated summary. All paths are constrained to ``frames/``.
+        """
+
+        frames_directory = (self.session_dir(session["session_id"]) / "frames").resolve()
+        if not frames_directory.exists():
+            return {
+                "frames_scanned": 0,
+                "frames_deleted": 0,
+                "bytes_deleted": 0,
+                "deletion_errors": [],
+            }
+
+        protected_paths: set[Path] = set()
+        values: list[Any] = [session.get("timeline", []), session.get("current_state", {})]
+        values.extend(protected_values)
+        for raw_path in self._collect_image_path_strings(values):
+            resolved = self._resolve_frame_artifact_locked(session, raw_path)
+            if resolved is not None:
+                protected_paths.add(resolved)
+
+        scanned = 0
+        deleted = 0
+        bytes_deleted = 0
+        deletion_errors: list[dict[str, str]] = []
+        for path in frames_directory.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+                continue
+            scanned += 1
+            resolved = path.resolve(strict=False)
+            if resolved in protected_paths:
+                continue
+            try:
+                size = path.stat().st_size
+                path.unlink()
+            except OSError as exc:
+                deletion_errors.append({"path": str(path), "error": str(exc)})
+                continue
+            deleted += 1
+            bytes_deleted += size
+        return {
+            "frames_scanned": scanned,
+            "frames_deleted": deleted,
+            "bytes_deleted": bytes_deleted,
+            "deletion_errors": deletion_errors[:32],
+        }
 
     def _load_locked(self, session_id: str) -> dict[str, Any]:
         path = self.session_path(session_id)
@@ -1318,6 +1428,10 @@ class SessionStore:
             # old data rather than a partially purged session.
             self._rewrite_journal_locked(session)
             self._save_locked(session)
+            raw_artifacts = self._purge_unreferenced_frame_artifacts_locked(
+                session,
+                protected_values=(normalised_summary,),
+            )
             return {
                 "session_id": session["session_id"],
                 "segment": segment_meta,
@@ -1325,6 +1439,7 @@ class SessionStore:
                 "raw_purged": True,
                 "purged_event_count": source_count,
                 "remaining_raw_event_count": len(session["timeline"]),
+                "raw_artifacts": raw_artifacts,
                 "path": str(destination),
             }
 

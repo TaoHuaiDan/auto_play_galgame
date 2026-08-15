@@ -192,6 +192,7 @@ class TextParserTests(unittest.TestCase):
             "SAVE LOAD Q.SAVE Q.LOAD\nVOICE\nV创0\n"
             "SAVE LOAD Q.SAVE Q.LOAD SYSTEM 《，》 > 羽《，； 0 ×\n"
             "VOlCf\nVO!CF\nVO'CE\n00000"
+            "\n000 00 |"
         )
 
         self.assertEqual(parsed["dialogue"], "")
@@ -207,6 +208,7 @@ class TextParserTests(unittest.TestCase):
                 "VO!CF",
                 "VO'CE",
                 "00000",
+                "000 00 |",
             ],
         )
         self.assertIn("SAVE LOAD", parsed["raw_text"])

@@ -2,6 +2,8 @@
 [mcp_servers.galgame]
 command = "C:\\Path\\To\\Python\\python.exe"
 args = ["-m", "galgame_mcp.server"]
+# Optional: add "--data-dir", "D:\\path\\to\\vn-data" to args to override
+# the environment variable below for this server instance.
 cwd = "D:\\path\\to\\auto_play_galgame"
 startup_timeout_sec = 20
 tool_timeout_sec = 120
@@ -15,4 +17,5 @@ default_tools_approval_mode = "prompt"
 # configure fixed regions/actions/timing from the actual game frame.
 
 [mcp_servers.galgame.env]
+# If omitted, the server uses <cwd>\\.galgame_sessions.
 GALGAME_MCP_DATA_DIR = "D:\\path\\to\\auto_play_galgame\\.galgame_sessions"

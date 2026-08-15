@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import hashlib
 import math
@@ -14,7 +15,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from .core import SCHEMA_VERSION, SessionStore, new_id, utc_now
+from .core import SCHEMA_VERSION, SessionError, SessionStore, new_id, utc_now
 from .evidence import TextEpisodeTracker, build_frame_evidence
 from .platform import (
     PlatformAutomationError,
@@ -23,7 +24,9 @@ from .platform import (
     capture_window_region_png,
     click_screen as native_click_screen,
     focus_window as native_focus_window,
+    focused_ocr_image as native_focused_ocr_image,
     hold_key as native_hold_key,
+    image_motion_score as native_image_motion_score,
     ocr_image as native_ocr_image,
     get_window_rect as native_get_window_rect,
     post_window_click as native_post_window_click,
@@ -35,7 +38,20 @@ from .platform import (
 from .text import detect_screen_type, looks_like_ui_residue, parse_screen_text
 
 
-STORE = SessionStore()
+def _parse_server_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the galgame MCP server")
+    parser.add_argument(
+        "--data-dir",
+        dest="data_dir",
+        default=None,
+        help="Store session data here; overrides GALGAME_MCP_DATA_DIR and the cwd default.",
+    )
+    args, _unknown = parser.parse_known_args(argv)
+    return args
+
+
+_BOOT_ARGS = _parse_server_args()
+STORE = SessionStore(root=_BOOT_ARGS.data_dir)
 
 # The last processed dialogue snapshot lets advance_game verify a click using
 # the preceding observe_game result instead of doing a second full capture and
@@ -50,6 +66,10 @@ _BOTTOM_SNAPSHOT_CACHE_MAX_AGE_SECONDS = 30.0
 # normal dialogue frames keep the existing fast path.
 _DEFAULT_TRANSITION_WAIT_SECONDS = 1.2
 _MAX_TRANSITION_WAIT_SECONDS = 10.0
+_DEFAULT_TRANSITION_ACCELERATE_DELAY_SECONDS = 0.6
+_DEFAULT_TRANSITION_PROBE_INTERVAL_SECONDS = 0.2
+_TRANSITION_PROBE_MAX_SAMPLES = 3
+_TRANSITION_MOTION_THRESHOLD = 0.02
 
 # Per-game timing defaults keep the current fast path unchanged.  Games with
 # a typewriter effect can opt into text_hash through configure_game_timing;
@@ -59,6 +79,9 @@ _DEFAULT_TIMING_PROFILE = {
     "strategy": "fixed",
     "post_click_wait_seconds": 0.05,
     "transition_wait_seconds": _DEFAULT_TRANSITION_WAIT_SECONDS,
+    "transition_accelerate": False,
+    "transition_accelerate_delay_seconds": _DEFAULT_TRANSITION_ACCELERATE_DELAY_SECONDS,
+    "transition_probe_interval_seconds": _DEFAULT_TRANSITION_PROBE_INTERVAL_SECONDS,
     "settle_timeout_seconds": 4.0,
     "settle_poll_seconds": 0.12,
     "stable_samples": 3,
@@ -70,6 +93,18 @@ _DEFAULT_TIMING_PROFILE = {
 # advance, because a recovered full frame may be the first stable frame after
 # a CG/chapter transition.
 _OCR_FALLBACK_SETTLE_SECONDS = 1.0
+
+# A rare second pass for frames whose normal full-window OCR has no usable
+# story text. It only enlarges the configured layout regions once.
+_OCR_FOCUS_SCALE = 2.0
+_OCR_FOCUS_TIMEOUT_SECONDS = 12
+
+# ``play_until_choice`` is a local scheduling loop, not the story/data
+# retention policy.  The default is deliberately uncapped; the normal loop
+# ends at a choice, an OCR/input safety error, or the compaction threshold.
+# An explicit max_steps remains available for short smoke tests.
+_MAX_PLAY_STEPS = 1000
+_MAX_PLAY_FRAME_ATTEMPTS = 1200
 
 # OCR often returns these controls from the dialogue crop even when it missed
 # the actual line.  Treating them as usable text would suppress the full-frame
@@ -90,6 +125,18 @@ _OCR_UI_ONLY_TOKENS = {
 # must establish a fresh full-frame reference; only later observations may use
 # the fast dialogue-region capture path.
 _WINDOW_FULL_CAPTURE_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _play_compaction_status(session_id: str) -> dict[str, Any] | None:
+    """Return compaction state without breaking isolated loop unit tests."""
+
+    try:
+        return STORE.compaction_status(session_id=session_id)
+    except SessionError:
+        # Some server tests replace get_session with an in-memory fixture that
+        # is intentionally not present in the real store. Production sessions
+        # always resolve here, so this only preserves those isolated tests.
+        return None
 
 
 def _bounded_transition_wait(value: float, *, name: str = "transition_wait_seconds") -> float:
@@ -148,6 +195,8 @@ def _resolve_timing_profile(
         raise ValueError("stable_samples 必须在 1 到 10 之间")
     if not isinstance(profile.get("require_text_change", True), bool):
         raise ValueError("require_text_change 必须是布尔值")
+    if not isinstance(profile.get("transition_accelerate", False), bool):
+        raise ValueError("transition_accelerate 必须是布尔值")
     return {
         "strategy": strategy,
         "post_click_wait_seconds": _bounded_timing_number(
@@ -158,6 +207,25 @@ def _resolve_timing_profile(
         ),
         "transition_wait_seconds": _bounded_transition_wait(
             profile.get("transition_wait_seconds", _DEFAULT_TRANSITION_WAIT_SECONDS)
+        ),
+        "transition_accelerate": bool(profile.get("transition_accelerate", False)),
+        "transition_accelerate_delay_seconds": _bounded_timing_number(
+            profile.get(
+                "transition_accelerate_delay_seconds",
+                _DEFAULT_TRANSITION_ACCELERATE_DELAY_SECONDS,
+            ),
+            name="transition_accelerate_delay_seconds",
+            minimum=0.1,
+            maximum=3.0,
+        ),
+        "transition_probe_interval_seconds": _bounded_timing_number(
+            profile.get(
+                "transition_probe_interval_seconds",
+                _DEFAULT_TRANSITION_PROBE_INTERVAL_SECONDS,
+            ),
+            name="transition_probe_interval_seconds",
+            minimum=0.05,
+            maximum=2.0,
         ),
         "settle_timeout_seconds": _bounded_timing_number(
             profile.get("settle_timeout_seconds", 4.0),
@@ -224,11 +292,82 @@ def _parsed_has_story_text(parsed: dict[str, Any] | None) -> bool:
         return True
     if _usable_story_text(parsed.get("dialogue")):
         return True
+    # A configured dialogue line may legitimately contain only punctuation,
+    # for example an ellipsis.  The parser has already separated it from UI
+    # residue, so a non-empty recognized line is still useful story state.
+    if parsed.get("text_status") == "recognized" and str(parsed.get("dialogue") or "").strip():
+        return True
     # Full-frame OCR may find centered narration or a chapter card that the
     # layout parser cannot safely assign to the bottom dialogue box yet. It is
     # still text for the fallback decision; the caller will record it as
     # unparsed fallback text and send only one guarded advance.
     return any(_usable_story_text(line) for line in (parsed.get("unparsed_lines") or []))
+
+
+def _common_ocr_focus_regions(
+    *,
+    ocr_region: dict[str, Any] | None,
+    layout_profile: dict[str, Any] | None,
+    image_size: tuple[int, int] | None,
+) -> list[dict[str, Any]]:
+    """Resolve the small set of layout regions used by focused OCR."""
+
+    if not image_size:
+        return []
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return []
+
+    profile = layout_profile if isinstance(layout_profile, dict) else {}
+    focus_regions: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+
+    def add_bound(label: str, region: Any) -> None:
+        if not isinstance(region, dict):
+            return
+        try:
+            resolved = _resolve_ocr_region(region, width=width, height=height)
+        except (TypeError, ValueError):
+            return
+        key = tuple(int(resolved[name]) for name in ("x", "y", "width", "height"))
+        if key in seen:
+            return
+        seen.add(key)
+        focus_regions.append({"label": label, **resolved})
+
+    add_bound("dialogue", ocr_region)
+    add_bound("speaker", profile.get("speaker_region"))
+    add_bound("choice", profile.get("choice_region"))
+    return focus_regions
+
+
+def _mark_ocr_uncertain(
+    payload: dict[str, Any],
+    image_path: Path,
+    *,
+    reason: str = "full_window_ocr_unresolved",
+) -> None:
+    """Expose a hard OCR miss as a visual-review stop, never as a transition success."""
+
+    marker = {
+        "required": True,
+        "status": "needs_codex_visual_review",
+        "reason": reason,
+        "image_path": str(image_path),
+    }
+    if isinstance(payload.get("ocr_focus"), dict):
+        marker["focus"] = copy.deepcopy(payload["ocr_focus"])
+    payload["ocr_uncertain"] = marker
+    evidence = payload.get("evidence")
+    if isinstance(evidence, dict):
+        blocking = evidence.setdefault("blocking_reasons", [])
+        if "ocr_uncertain" not in blocking:
+            blocking.append("ocr_uncertain")
+        unresolved = evidence.setdefault("unresolved_channels", [])
+        if "visual_transition" not in unresolved:
+            unresolved.append("visual_transition")
+        evidence["ocr_uncertain"] = copy.deepcopy(marker)
+
 
 mcp = FastMCP(
     name="galgame-mcp",
@@ -242,14 +381,20 @@ mcp = FastMCP(
         "attach_game 默认只验证并绑定窗口，不会切换前台；focus_window=true、focus_before_capture=true 或 background=false 才是明确的前台路径。"
         "ocr_region 是文本框配置；首次窗口帧仍是完整窗口，后续本地 OCR 可使用同一范围的快速区域帧。"
         "快速对白 OCR 为空、仅识别到人物名或只得到 VOICE/AUTO 等界面残留时，会自动做一次完整窗口 OCR 保底；"
-        "完整帧恢复出文字后先等待 1 秒再发送一次推进，完整帧仍无文字才按转场处理并停止盲点。"
+        "正常全窗口 OCR 没有可用故事文本时，才会对当前游戏 profile 的 dialogue_region、speaker_region 和 choice_region"
+        "各做一次 2 倍区域放大 OCR；不做全屏候选搜索、对比度增强或多轮重试。第二次仍无法确认时会返回"
+        "ocr_uncertain、保存截图并请求 Codex 视觉复核，自动游玩会在此处停止，不会盲点。"
         "不同游戏的对白框、姓名框、选项区域和姓名/对白符号通过 configure_game_layout 写入当前会话，解析器不按游戏标题猜测符号。"
-        "推进后对白框暂时为空时，advance_game/play_until_choice 会在 transition_wait_seconds 的有界等待窗口内本地重试，期间不会发送额外点击；"
+        "推进后对白框暂时为空时，advance_game/play_until_choice 会在 transition_wait_seconds 的有界等待窗口内本地重试；默认不会发送额外点击。"
+        "只有配置 transition_accelerate=true 且完整窗口连续探测确认画面发生明显转场时，才最多额外点击一次；稳定画面 OCR 为空仍返回 ocr_uncertain。"
         "等待策略通过 configure_game_timing 按游戏配置；fixed 适合关闭打字机动画的游戏，text_hash 会要求点击后底部文本先变化并连续稳定若干次，才允许下一次输入。"
-        "需要连续无人值守推进时使用 play_until_choice；它在本地循环 OCR、记录对白并推进，直到出现游戏选项或安全上限，期间不会逐帧把结果发给 Codex。"
+        "需要连续无人值守推进时使用 play_until_choice；默认不设步数或 batch 字符上限，"
+        "它在本地循环 OCR、记录对白并推进，直到出现游戏选项、OCR/输入安全错误或 compaction_due，"
+        "期间不会逐帧把结果发给 Codex。max_steps/max_batch_chars 仅适合显式冒烟测试。"
         "不同游戏的命名输入通过 configure_game_actions 配置，再用 perform_game_action 执行；动作只允许 click/key/scroll/hold/wait/focus 等安全类型，不能执行任意代码。"
         "当 get_codex_context 返回 compaction.summary_due=true 时，调用 get_compaction_request 取得一个有界原始事件段，"
-        "由 Codex 按 summary_contract 生成详细结构化总结，再调用 save_compaction；只有校验通过后 MCP 才会清除对应的原始事件，保留 compactions/ 下的省流文件。"
+        "由 Codex 按 summary_contract 生成详细结构化总结，再调用 save_compaction；只有校验通过后 MCP 才会清除对应的原始事件，"
+        "并删除不再被活动状态引用的 frames 原始截图，保留 compactions/ 下的省流文件。"
     ),
 )
 
@@ -270,6 +415,13 @@ def list_sessions(limit: int = 20) -> list[dict[str, Any]]:
     """列出最近的剧情会话，便于从中断处恢复。"""
 
     return STORE.list_sessions(limit=limit)
+
+
+@mcp.tool()
+def get_storage_info() -> dict[str, Any]:
+    """返回当前 MCP 会话数据目录及其配置来源。"""
+
+    return STORE.storage_info()
 
 
 @mcp.tool()
@@ -617,7 +769,10 @@ def _capture_for_session(
 
 def _capture_result(payload: dict[str, Any], image_path: Path, include_image: bool) -> Any:
     public_payload = {key: value for key, value in payload.items() if not key.startswith("_")}
-    if include_image:
+    visual_review = isinstance(public_payload.get("ocr_uncertain"), dict) and bool(
+        public_payload["ocr_uncertain"].get("required")
+    )
+    if include_image or visual_review:
         return [json.dumps(public_payload, ensure_ascii=False), Image(path=image_path)]
     return public_payload
 
@@ -1234,6 +1389,11 @@ def _remember_bottom_snapshot(session: dict[str, Any], payload: dict[str, Any]) 
     snapshot = _bottom_text_snapshot(payload)
     if snapshot.get("available") and snapshot.get("detected"):
         _BOTTOM_SNAPSHOT_CACHE[str(session["session_id"])] = (time.monotonic(), snapshot)
+    else:
+        # Do not reuse an old valid frame after an OCR-uncertain result. The
+        # next advance must establish a fresh baseline and can then stop for
+        # Codex visual review instead of clicking on stale evidence.
+        _BOTTOM_SNAPSHOT_CACHE.pop(str(session["session_id"]), None)
 
 
 def _cached_bottom_snapshot(session: dict[str, Any]) -> dict[str, Any] | None:
@@ -1280,9 +1440,7 @@ def _fast_capture_has_text(payload: dict[str, Any]) -> bool:
     # Speaker-only frames and UI residue (VOICE/AUTO/000) are deliberately
     # treated as a miss.  The full-window OCR can recover the line or confirm
     # that the game is actually in a transition.
-    if _usable_story_text(processed.get("dialogue")):
-        return True
-    return False
+    return _parsed_has_story_text(processed)
 
 
 def _process_capture_text(
@@ -1414,6 +1572,228 @@ def _capture_processed_frame(
     return payload, image_path
 
 
+def _transition_probe_state(payload: dict[str, Any]) -> str:
+    """Classify one full-frame probe without treating OCR emptiness as proof."""
+
+    if payload.get("screen_type") == "settings":
+        return "settings"
+    parsed = payload.get("processed_text") or {}
+    if list(parsed.get("choices") or []):
+        return "choice"
+    evidence = payload.get("evidence") or {}
+    if "unknown_text" in (evidence.get("blocking_reasons") or []):
+        return "unknown_text"
+    if list(parsed.get("unknown_lines") or []):
+        return "unknown_text"
+    bottom_snapshot = _bottom_text_snapshot(payload)
+    if (
+        _bottom_story_text(bottom_snapshot)
+        or _parsed_has_story_text(parsed)
+        or str(parsed.get("speaker") or "").strip()
+    ):
+        return "story_text"
+    if not bool((payload.get("ocr") or {}).get("available")):
+        return "ocr_unavailable"
+    return "blank"
+
+
+def _is_post_click_transition_ocr_candidate(payload: dict[str, Any]) -> bool:
+    """Allow a post-click blank OCR frame into the bounded transition wait.
+
+    A full-window OCR miss is normally a hard stop.  The exception is the
+    short-lived frame produced while a VN is fading/changing a character or
+    background immediately after an accepted advance input.  This predicate
+    is deliberately narrow: any recovered story text, speaker-only text,
+    choices, or unknown OCR remains a stop condition.
+    """
+
+    parsed = payload.get("processed_text") or {}
+    if (
+        str(parsed.get("speaker") or "").strip()
+        or str(parsed.get("dialogue") or "").strip()
+        or list(parsed.get("choices") or [])
+        or list(parsed.get("unknown_lines") or [])
+    ):
+        return False
+    evidence = payload.get("evidence") or {}
+    channels = evidence.get("channels") or {}
+    transition = channels.get("visual_transition") or {}
+    if isinstance(transition, dict) and transition.get("status") == "active":
+        return True
+    blocking_reasons = set(evidence.get("blocking_reasons") or [])
+    return {"dialogue_unresolved", "ocr_uncertain"}.issubset(blocking_reasons)
+
+
+def _classify_transition_probe(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """Use bounded visual samples to decide whether a blank frame is a fade."""
+
+    states = [str(item.get("state") or "blank") for item in samples]
+    for blocking_state in ("settings", "choice", "unknown_text", "story_text", "ocr_unavailable"):
+        if blocking_state in states:
+            return {
+                "status": blocking_state,
+                "confirmed": False,
+                "sample_count": len(samples),
+                "motion_supported": False,
+            }
+
+    scene_scores = [
+        float(item["scene_change_score"])
+        for item in samples
+        if isinstance(item.get("scene_change_score"), (int, float))
+    ]
+    motion_scores = [
+        float(item["motion_from_previous"])
+        for item in samples
+        if isinstance(item.get("motion_from_previous"), (int, float))
+    ]
+    motion_supported = bool(scene_scores or motion_scores)
+    max_scene_change = max(scene_scores, default=0.0)
+    max_motion = max(motion_scores, default=0.0)
+    confirmed = bool(
+        len(samples) >= 2
+        and motion_supported
+        and max(max_scene_change, max_motion) >= _TRANSITION_MOTION_THRESHOLD
+    )
+    return {
+        "status": "transition_confirmed" if confirmed else "ocr_uncertain",
+        "confirmed": confirmed,
+        "sample_count": len(samples),
+        "motion_supported": motion_supported,
+        "scene_change_score": round(max_scene_change, 6),
+        "max_motion_score": round(max_motion, 6),
+        "motion_threshold": _TRANSITION_MOTION_THRESHOLD,
+    }
+
+
+def _probe_transition_after_click(
+    *,
+    before_image_path: Path | None,
+    first_payload: dict[str, Any] | None,
+    first_image_path: Path | None,
+    timing: dict[str, Any],
+    window_title: str | None,
+    capture_mode: str,
+    session: dict[str, Any],
+    language: str,
+    include_raw_text: bool,
+    ocr_region: dict[str, Any] | None,
+    action_event: dict[str, Any] | None,
+    background: bool,
+    background_input_method: str,
+    auto_return_from_settings: bool,
+) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+    """Capture up to three full frames after a click and classify a blank scene.
+
+    The helper never sends input.  It is intentionally safe to call before the
+    optional one-click accelerator: a stable OCR miss returns ``ocr_uncertain``
+    and leaves the decision with Codex.
+    """
+
+    current_payload = first_payload
+    current_image_path = first_image_path
+    if (
+        current_payload is None
+        or current_image_path is None
+        or current_payload.get("capture_scope") == "window_dialogue_region"
+    ):
+        current_payload, current_image_path = _capture_processed_frame(
+            window_title=window_title,
+            capture_mode=capture_mode,
+            session=session,
+            ocr=True,
+            record_text=False,
+            language=language,
+            include_raw_text=include_raw_text,
+            ocr_region=ocr_region,
+            include_image=False,
+            action_event=action_event,
+            force_full=True,
+        )
+    current_payload, current_image_path = _auto_return_from_settings(
+        current_payload,
+        session,
+        title=window_title,
+        capture_mode=capture_mode,
+        ocr=True,
+        record_text=False,
+        language=language,
+        include_raw_text=include_raw_text,
+        enabled=auto_return_from_settings,
+        background=background,
+        background_input_method=background_input_method,
+        ocr_region=ocr_region,
+    )
+
+    samples: list[dict[str, Any]] = []
+    previous_image_path: Path | None = None
+    started = time.perf_counter()
+    probe_budget = float(timing.get("transition_wait_seconds", 0.0))
+    probe_interval = float(timing.get("transition_probe_interval_seconds", 0.2))
+    while True:
+        scene_change_score = (
+            native_image_motion_score(before_image_path, current_image_path)
+            if before_image_path is not None
+            else None
+        )
+        motion_from_previous = (
+            native_image_motion_score(previous_image_path, current_image_path)
+            if previous_image_path is not None
+            else None
+        )
+        samples.append(
+            {
+                "state": _transition_probe_state(current_payload),
+                "scene_change_score": scene_change_score,
+                "motion_from_previous": motion_from_previous,
+            }
+        )
+        if samples[-1]["state"] != "blank":
+            break
+        if len(samples) >= _TRANSITION_PROBE_MAX_SAMPLES:
+            break
+        elapsed = time.perf_counter() - started
+        remaining = probe_budget - elapsed
+        if remaining <= 0:
+            break
+        time.sleep(min(probe_interval, remaining))
+        previous_image_path = current_image_path
+        current_payload, current_image_path = _capture_processed_frame(
+            window_title=window_title,
+            capture_mode=capture_mode,
+            session=session,
+            ocr=True,
+            record_text=False,
+            language=language,
+            include_raw_text=include_raw_text,
+            ocr_region=ocr_region,
+            include_image=False,
+            action_event=action_event,
+            force_full=True,
+        )
+        current_payload, current_image_path = _auto_return_from_settings(
+            current_payload,
+            session,
+            title=window_title,
+            capture_mode=capture_mode,
+            ocr=True,
+            record_text=False,
+            language=language,
+            include_raw_text=include_raw_text,
+            enabled=auto_return_from_settings,
+            background=background,
+            background_input_method=background_input_method,
+            ocr_region=ocr_region,
+        )
+
+    decision = _classify_transition_probe(samples)
+    decision["probe_elapsed_seconds"] = round(time.perf_counter() - started, 3)
+    decision["probe_interval_seconds"] = probe_interval
+    decision["before_image_available"] = before_image_path is not None
+    decision["max_samples"] = _TRANSITION_PROBE_MAX_SAMPLES
+    return current_payload, current_image_path, decision
+
+
 def _wait_for_text_hash_stable(
     *,
     first_payload: dict[str, Any],
@@ -1543,7 +1923,12 @@ def _batch_dialogue_item(payload: dict[str, Any], index: int) -> dict[str, Any] 
     speaker = parsed.get("speaker")
     dialogue = parsed.get("dialogue")
     choices = list(parsed.get("choices") or [])
-    if dialogue and not _usable_story_text(dialogue) and not choices:
+    if (
+        dialogue
+        and not _usable_story_text(dialogue)
+        and parsed.get("text_status") != "recognized"
+        and not choices
+    ):
         # Never turn a control residue such as AUTO/VOICE/000 into an input.
         dialogue = None
     # Some VN engines render a speaker label before a punctuation-only line
@@ -1780,10 +2165,10 @@ def _process_local_text(
         # string to the caller.
         payload["raw_text"] = raw_text or full_raw_text
     full_parsed: dict[str, Any] | None = None
+    full_source_result: dict[str, Any] = full_ocr_result
     if (
         full_raw_text
         and payload.get("capture_scope") == "window_full"
-        and ocr_region is not None
     ):
         full_parsed = parse_screen_text(
             full_raw_text,
@@ -1800,6 +2185,74 @@ def _process_local_text(
             image_size=image_size,
             layout_profile=frame_layout_profile,
         )
+
+    # Only an unusable normal full-window result reaches this second pass.
+    # The regions come from the active game's layout profile; there is no
+    # full-screen candidate search or multi-variant enhancement loop.
+    normal_story_found = _parsed_has_story_text(parsed) or _parsed_has_story_text(full_parsed)
+    if (
+        payload.get("capture_scope") == "window_full"
+        and full_screen_type != "settings"
+        and bool(full_ocr_result.get("available"))
+        and not normal_story_found
+    ):
+        focus_regions = _common_ocr_focus_regions(
+            ocr_region=ocr_region,
+            layout_profile=frame_layout_profile,
+            image_size=image_size,
+        )
+        if focus_regions:
+            try:
+                focused_result = native_focused_ocr_image(
+                    str(image_path),
+                    focus_regions,
+                    language=language,
+                    timeout_sec=_OCR_FOCUS_TIMEOUT_SECONDS,
+                    scale=_OCR_FOCUS_SCALE,
+                )
+            except Exception as exc:  # pragma: no cover - platform-specific fallback
+                focused_result = {
+                    "available": False,
+                    "status": "error",
+                    "backend": "ocr_focus",
+                    "text": "",
+                    "message": str(exc),
+                    "image_path": str(image_path),
+                }
+            focus_public = _compact_ocr_result(focused_result)
+            focus_public.update(
+                {
+                    "attempted": True,
+                    "mode": "profile_region_zoom",
+                    "scale": focused_result.get("scale", _OCR_FOCUS_SCALE),
+                    "regions": focus_regions,
+                    "attempt_count": len(focused_result.get("attempts") or []),
+                }
+            )
+            payload["ocr_focus"] = focus_public
+            focused_text = str(focused_result.get("text") or "").strip()
+            if focused_text:
+                focused_parsed = parse_screen_text(
+                    focused_text,
+                    regions=focused_result.get("regions") or [],
+                    image_size=image_size,
+                    layout_profile=frame_layout_profile,
+                )
+                if _parsed_has_story_text(focused_parsed):
+                    parsed = focused_parsed
+                    full_parsed = focused_parsed
+                    source_result = focused_result
+                    full_source_result = focused_result
+                    raw_text = focused_text
+                    payload["_ocr_regions"] = focused_result.get("regions") or []
+                    payload["_dialogue_ocr_regions"] = focused_result.get("regions") or []
+        else:
+            payload["ocr_focus"] = {
+                "attempted": False,
+                "mode": "profile_region_zoom",
+                "reason": "no_configured_focus_regions",
+            }
+
     if full_parsed and _parsed_has_story_text(full_parsed) and (
         parsed is None or not _parsed_has_story_text(parsed)
     ):
@@ -1807,16 +2260,24 @@ def _process_local_text(
         # full-frame parse in that case; it can recover centered narration and
         # dialogue that fell just outside the configured crop.
         parsed = full_parsed
-        source_result = full_ocr_result
+        source_result = full_source_result
+        raw_text = str(full_source_result.get("text") or full_raw_text).strip()
     elif parsed is None and full_parsed and full_screen_type:
         parsed = full_parsed
-        source_result = full_ocr_result
+        source_result = full_source_result
+        raw_text = str(full_source_result.get("text") or full_raw_text).strip()
     if parsed is None:
         payload["evidence"] = build_frame_evidence(
             {},
             screen_type=full_screen_type,
             ocr_available=bool((payload.get("ocr") or {}).get("available")),
         )
+        if (
+            payload.get("capture_scope") != "window_dialogue_region"
+            and bool((payload.get("ocr") or {}).get("available"))
+            and full_screen_type != "settings"
+        ):
+            _mark_ocr_uncertain(payload, image_path)
         return payload
     if full_parsed and full_parsed.get("choices"):
         parsed["choices"] = list(full_parsed.get("choices") or [])
@@ -1840,6 +2301,12 @@ def _process_local_text(
     # result, but do not pollute the route timeline with fake dialogue/options.
     if screen_type == "settings":
         return payload
+    if (
+        payload.get("capture_scope") != "window_dialogue_region"
+        and bool((payload.get("ocr") or {}).get("available"))
+        and not _parsed_has_story_text(parsed)
+    ):
+        _mark_ocr_uncertain(payload, image_path)
     if not record_text or not (parsed.get("dialogue") or parsed.get("choices")):
         return payload
     if _same_processed_text(session, parsed):
@@ -2019,7 +2486,9 @@ def configure_game_timing(
 
     ``strategy="fixed"`` 保持快速固定等待；``strategy="text_hash"``
     会在每次推进后本地轮询底部文本框，要求文本先发生变化并连续稳定
-    ``stable_samples`` 次，才允许下一次输入。传空对象可清除当前游戏的
+    ``stable_samples`` 次，才允许下一次输入。若某个游戏支持点击跳过转场，
+    可显式设置 ``transition_accelerate=true``；MCP 会用完整窗口多帧画面变化
+    和 OCR 排除条件确认转场后，最多额外点击一次。传空对象可清除当前游戏的
     自定义 timing profile。
     """
 
@@ -2415,6 +2884,13 @@ def advance_game(
         focused = None
     before_bottom_text: dict[str, Any] | None = None
     baseline: dict[str, Any] | None = None
+    baseline_path: Path | None = None
+    transition_baseline_image_path: Path | None = None
+    transition_acceleration_enabled = bool(
+        ocr
+        and timing["transition_accelerate"]
+        and timing["strategy"] == "fixed"
+    )
     if ocr:
         before_bottom_text = _cached_bottom_snapshot(session)
         if before_bottom_text is None:
@@ -2452,6 +2928,37 @@ def advance_game(
                     ocr_region=effective_ocr_region,
                 )
             before_bottom_text = _bottom_text_snapshot(baseline)
+    if transition_acceleration_enabled:
+        # Motion comparison needs a complete pre-click frame.  Do not OCR it:
+        # this optional path adds one local capture, not another OCR pass.
+        if baseline_path is not None and baseline and baseline.get("capture_scope") != "window_dialogue_region":
+            transition_baseline_image_path = baseline_path
+        else:
+            transition_baseline, transition_baseline_image_path = _capture_for_session(
+                window_title=title,
+                capture_mode=capture_mode,
+                session_id=session["session_id"],
+                fast_region=None,
+            )
+            if transition_baseline.get("capture_scope") == "window_dialogue_region":
+                transition_baseline_image_path = None
+    if (
+        ocr
+        and baseline is not None
+        and isinstance(baseline.get("ocr_uncertain"), dict)
+        and baseline["ocr_uncertain"].get("required")
+    ):
+        baseline["advance_blocked"] = {
+            "required": True,
+            "reason": "ocr_uncertain",
+            "message": "全窗口 OCR 无法确认当前画面，已阻止推进并请求 Codex 视觉复核。",
+        }
+        _remember_bottom_snapshot(session, baseline)
+        return _capture_result(
+            baseline,
+            baseline_path or Path(str(baseline["image_path"])),
+            include_image,
+        )
     control = game.get("control", {})
     key = control.get("advance_key") or "SPACE"
     configured_hold = control.get("advance_hold_seconds", 0.0)
@@ -2495,6 +3002,9 @@ def advance_game(
             "hold_seconds": hold_duration,
             "wait_seconds": duration,
             "wait_strategy": timing["strategy"],
+            "transition_accelerate": timing["transition_accelerate"],
+            "transition_accelerate_delay_seconds": timing["transition_accelerate_delay_seconds"],
+            "transition_probe_interval_seconds": timing["transition_probe_interval_seconds"],
             "settle_timeout_seconds": timing["settle_timeout_seconds"],
             "settle_poll_seconds": timing["settle_poll_seconds"],
             "stable_samples": timing["stable_samples"],
@@ -2595,9 +3105,116 @@ def advance_game(
                 include_raw_text=include_raw_text,
                 ocr_region=effective_ocr_region,
             )
+    transition_acceleration: dict[str, Any] | None = None
+    if (
+        transition_acceleration_enabled
+        and before_bottom_text
+        and before_bottom_text.get("detected")
+        and not _bottom_text_snapshot(payload).get("detected")
+    ):
+        payload, image_path, transition_acceleration = _probe_transition_after_click(
+            before_image_path=transition_baseline_image_path,
+            first_payload=payload,
+            first_image_path=image_path,
+            timing=timing,
+            window_title=title,
+            capture_mode=capture_mode,
+            session=session,
+            language=language,
+            include_raw_text=include_raw_text,
+            ocr_region=effective_ocr_region,
+            action_event=action,
+            background=background,
+            background_input_method=background_input_method,
+            auto_return_from_settings=auto_return_from_settings,
+        )
+        if transition_acceleration.get("confirmed"):
+            if hold_duration > 0:
+                transition_acceleration.update(
+                    {
+                        "extra_click_sent": False,
+                        "extra_click_skipped_reason": "hold_action_not_discrete",
+                    }
+                )
+            else:
+                extra_delay = timing["transition_accelerate_delay_seconds"]
+                if extra_delay:
+                    time.sleep(extra_delay)
+                if background:
+                    click_point = _window_center_screen_point(payload)
+                    if click_point is None:
+                        if not title:
+                            raise ValueError("background=true 时必须先 attach_game 绑定 window_title")
+                        click_point = _window_center_screen_point({"window": native_get_window_rect(title)})
+                    if click_point is None:
+                        raise ValueError("无法确定后台推进的窗口中心坐标")
+                    extra_result = native_post_window_click(
+                        title=title,
+                        x=click_point[0],
+                        y=click_point[1],
+                        button="left",
+                        clicks=1,
+                        interval_ms=0,
+                        delivery=background_input_method,
+                    )
+                    extra_input_type = "background_click"
+                else:
+                    extra_result = native_send_key(key=key, presses=1, interval_ms=0)
+                    extra_input_type = "foreground_key"
+                extra_action = STORE.record_action(
+                    "advance_game_transition_accelerate",
+                    {
+                        "key": key,
+                        "input_type": extra_input_type,
+                        "wait_seconds": duration,
+                        "wait_strategy": timing["strategy"],
+                        "transition_accelerate_delay_seconds": extra_delay,
+                        "background": background,
+                        "trigger": transition_acceleration,
+                        **extra_result,
+                    },
+                    session_id=session["session_id"],
+                )
+                transition_acceleration.update(
+                    {
+                        "extra_click_sent": True,
+                        "extra_click_action": extra_action,
+                    }
+                )
+                if duration:
+                    time.sleep(duration)
+                payload, image_path = _capture_processed_frame(
+                    window_title=title,
+                    capture_mode=capture_mode,
+                    session=session,
+                    ocr=ocr,
+                    record_text=record_text,
+                    language=language,
+                    include_raw_text=include_raw_text,
+                    ocr_region=effective_ocr_region,
+                    include_image=include_image,
+                    action_event=extra_action,
+                    force_full=True,
+                )
+                payload, image_path = _auto_return_from_settings(
+                    payload,
+                    session,
+                    title=title,
+                    capture_mode=capture_mode,
+                    ocr=ocr,
+                    record_text=record_text,
+                    language=language,
+                    include_raw_text=include_raw_text,
+                    enabled=auto_return_from_settings,
+                    background=background,
+                    background_input_method=background_input_method,
+                    ocr_region=effective_ocr_region,
+                )
     verification = _compare_bottom_text(before_bottom_text, payload)
     if timing_wait is not None:
         verification["timing_wait"] = timing_wait
+    if transition_acceleration is not None:
+        verification["transition_acceleration"] = transition_acceleration
     transition_retries = 0
     transition_waited = 0.0
     if (
@@ -2655,6 +3272,8 @@ def advance_game(
         verification["settle_retries"] = transition_retries
         verification["transition_waited_seconds"] = round(transition_waited, 3)
         verification["transition_settled"] = bool(_bottom_text_snapshot(payload).get("detected"))
+    if transition_acceleration is not None:
+        payload["transition_acceleration"] = transition_acceleration
     payload["input_verification"] = verification
     _remember_bottom_snapshot(session, payload)
     return _capture_result(payload, image_path, include_image)
@@ -2693,7 +3312,7 @@ def _probe_full_window_for_choices(
 
 @mcp.tool(structured_output=False)
 def play_until_choice(
-    max_steps: int = 40,
+    max_steps: int | None = None,
     wait_seconds: float | None = None,
     transition_wait_seconds: float | None = None,
     wait_strategy: str | None = None,
@@ -2708,7 +3327,7 @@ def play_until_choice(
     background: bool = True,
     background_input_method: str = "send",
     ocr_region: dict[str, Any] | None = None,
-    max_batch_chars: int = 6000,
+    max_batch_chars: int | None = None,
 ) -> Any:
     """Locally read and advance many dialogue frames until a game choice appears.
 
@@ -2719,14 +3338,20 @@ def play_until_choice(
 
     if not ocr:
         raise ValueError("play_until_choice 必须启用 ocr=true")
-    try:
-        step_limit = max(0, min(int(max_steps), 200))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("max_steps 必须是数字") from exc
-    try:
-        batch_char_limit = max(1000, min(int(max_batch_chars), 100000))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("max_batch_chars 必须是数字") from exc
+    if max_steps is None:
+        step_limit: int | None = None
+    else:
+        try:
+            step_limit = max(0, min(int(max_steps), _MAX_PLAY_STEPS))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_steps 必须是数字或 null") from exc
+    if max_batch_chars is None:
+        batch_char_limit: int | None = None
+    else:
+        try:
+            batch_char_limit = max(1000, min(int(max_batch_chars), 100000))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_batch_chars 必须是数字或 null") from exc
     session = STORE.get_session(session_id=session_id)
     timing = _resolve_timing_profile(
         session,
@@ -2738,6 +3363,9 @@ def play_until_choice(
     transition_wait = timing["transition_wait_seconds"]
     game = session.get("game", {})
     title = game.get("window_title")
+    transition_acceleration_enabled = bool(
+        timing["transition_accelerate"] and timing["strategy"] == "fixed"
+    )
     if background and not title:
         raise ValueError("background=true 时必须先 attach_game 绑定 window_title")
     if title and not background:
@@ -2752,7 +3380,7 @@ def play_until_choice(
     advance_count = 0
     frame_count = 0
     settings_recoveries = 0
-    stop_reason = "max_steps"
+    stop_reason = "not_stopped"
     final_payload: dict[str, Any] | None = None
     final_image_path: Path | None = None
     internal_error: dict[str, Any] | None = None
@@ -2764,19 +3392,24 @@ def play_until_choice(
     transition_waited = 0.0
     transition_probe_attempts = 0
     transition_probe_count = 0
+    transition_acceleration_count = 0
+    transition_acceleration_records: list[dict[str, Any]] = []
     ocr_fallback_settles = 0.0
     pending_frame: tuple[dict[str, Any], Path] | None = None
     pending_settle_before: dict[str, Any] | None = None
     timing_waits: list[dict[str, Any]] = []
     timing_settle_failed = False
     episode_tracker = TextEpisodeTracker(stable_samples=timing["stable_samples"])
-    # A malformed OCR frame must never turn max_steps into an unbounded
-    # capture loop.  In the normal path this leaves several attempts per
-    # requested advance for transition settling and one full-window choice
-    # probe; in the no-action path it guarantees a bounded return well before
-    # the MCP client timeout.
-    frame_attempt_limit = max(10, min(200, step_limit * 3 + 6))
+    # Explicit max_steps calls retain a bounded frame budget for smoke tests.
+    # The normal unattended path leaves this unset and relies on OCR/input
+    # safety stops plus the compaction threshold instead.
+    frame_attempt_limit = (
+        None
+        if step_limit is None
+        else max(10, min(_MAX_PLAY_FRAME_ATTEMPTS, step_limit * 3 + 6))
+    )
     frame_attempts = 0
+    compaction_status = _play_compaction_status(session["session_id"])
 
     def probe_choice_frame() -> tuple[dict[str, Any], Path]:
         probe_payload, probe_image_path = _probe_full_window_for_choices(
@@ -2804,8 +3437,11 @@ def play_until_choice(
         )
 
     while True:
+        if compaction_status and compaction_status.get("summary_due"):
+            stop_reason = "compaction_due"
+            break
         frame_attempts += 1
-        if frame_attempts > frame_attempt_limit:
+        if frame_attempt_limit is not None and frame_attempts > frame_attempt_limit:
             stop_reason = "frame_safety_limit"
             break
         if pending_frame is not None:
@@ -2907,6 +3543,17 @@ def play_until_choice(
             stop_reason = "settings_return_button_not_detected"
             break
 
+        ocr_uncertain = payload.get("ocr_uncertain") or {}
+        post_click_transition_candidate = bool(
+            ocr_uncertain.get("required")
+            and advance_count > 0
+            and last_action is not None
+            and _is_post_click_transition_ocr_candidate(payload)
+        )
+        if ocr_uncertain.get("required") and not post_click_transition_candidate:
+            stop_reason = "ocr_uncertain"
+            break
+
         item = _batch_dialogue_item(payload, len(batch) + 1)
         parsed = payload.get("processed_text") or {}
         choices = list(parsed.get("choices") or [])
@@ -2936,10 +3583,17 @@ def play_until_choice(
             # it as dialogue and sending a potentially unsafe click.
             stop_reason = "unknown_text_detected"
             break
+        # Raw events are retained until Codex confirms a semantic summary.
+        # Stop before the next input once the store crosses its threshold so a
+        # long unattended run cannot keep growing events.jsonl indefinitely.
+        compaction_status = _play_compaction_status(session["session_id"])
+        if compaction_status and compaction_status.get("summary_due"):
+            stop_reason = "compaction_due"
+            break
         # A zero-step call is still allowed to return the current frame, but
         # it must never enter the blank-frame retry loop and accidentally
         # advance the game.
-        if advance_count >= step_limit:
+        if step_limit is not None and advance_count >= step_limit:
             stop_reason = "max_steps"
             break
 
@@ -3107,16 +3761,34 @@ def play_until_choice(
             break
         if item_key not in seen_items:
             item_chars = len(str(item.get("dialogue") or "")) + sum(len(str(choice)) for choice in choices)
-            if batch and batch_chars + item_chars > batch_char_limit:
+            if (
+                batch_char_limit is not None
+                and batch
+                and batch_chars + item_chars > batch_char_limit
+            ):
                 stop_reason = "batch_char_limit"
                 break
             seen_items.add(item_key)
             batch.append(item)
             batch_chars += item_chars
 
-        if advance_count >= step_limit:
+        if step_limit is not None and advance_count >= step_limit:
             stop_reason = "max_steps"
             break
+
+        transition_baseline_image_path: Path | None = None
+        if transition_acceleration_enabled:
+            if payload.get("capture_scope") != "window_dialogue_region":
+                transition_baseline_image_path = image_path
+            else:
+                transition_baseline, transition_baseline_image_path = _capture_for_session(
+                    window_title=title,
+                    capture_mode=capture_mode,
+                    session_id=session["session_id"],
+                    fast_region=None,
+                )
+                if transition_baseline.get("capture_scope") == "window_dialogue_region":
+                    transition_baseline_image_path = None
 
         input_type, input_result = _advance_input_for_batch(
             session=session,
@@ -3148,6 +3820,156 @@ def play_until_choice(
         if duration:
             time.sleep(duration)
 
+        if transition_acceleration_enabled and transition_baseline_image_path is not None:
+            try:
+                first_after_payload, first_after_image_path = _capture_processed_frame(
+                    window_title=title,
+                    capture_mode=capture_mode,
+                    session=session,
+                    ocr=True,
+                    record_text=record_text,
+                    language=language,
+                    include_raw_text=include_raw_text,
+                    ocr_region=effective_ocr_region,
+                    include_image=include_image,
+                    action_event=last_action,
+                )
+                first_after_payload, first_after_image_path = _auto_return_from_settings(
+                    first_after_payload,
+                    session,
+                    title=title,
+                    capture_mode=capture_mode,
+                    ocr=True,
+                    record_text=record_text,
+                    language=language,
+                    include_raw_text=include_raw_text,
+                    enabled=auto_return_from_settings,
+                    background=background,
+                    background_input_method=background_input_method,
+                    ocr_region=effective_ocr_region,
+                )
+            except Exception as exc:
+                internal_error = {
+                    "stage": "post_click_transition_candidate",
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(limit=12),
+                }
+                stop_reason = "internal_error"
+                break
+            first_after_state = _transition_probe_state(first_after_payload)
+            if first_after_state != "blank":
+                final_payload, final_image_path = first_after_payload, first_after_image_path
+                pending_frame = (first_after_payload, first_after_image_path)
+            else:
+                try:
+                    transition_payload, transition_image_path, transition_decision = _probe_transition_after_click(
+                        before_image_path=transition_baseline_image_path,
+                        first_payload=first_after_payload,
+                        first_image_path=first_after_image_path,
+                        timing=timing,
+                        window_title=title,
+                        capture_mode=capture_mode,
+                        session=session,
+                        language=language,
+                        include_raw_text=include_raw_text,
+                        ocr_region=effective_ocr_region,
+                        action_event=last_action,
+                        background=background,
+                        background_input_method=background_input_method,
+                        auto_return_from_settings=auto_return_from_settings,
+                    )
+                except Exception as exc:
+                    internal_error = {
+                        "stage": "transition_probe",
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "traceback": traceback.format_exc(limit=12),
+                    }
+                    stop_reason = "internal_error"
+                    break
+                final_payload, final_image_path = transition_payload, transition_image_path
+                frame_count += max(0, int(transition_decision.get("sample_count", 1)) - 1)
+                if first_after_payload.get("capture_scope") == "window_dialogue_region":
+                    frame_count += 1
+                transition_acceleration_records.append(transition_decision)
+                pending_frame = (transition_payload, transition_image_path)
+                if not transition_decision.get("confirmed"):
+                    continue
+                extra_delay = timing["transition_accelerate_delay_seconds"]
+                if extra_delay:
+                    time.sleep(extra_delay)
+                extra_input_type, extra_input_result = _advance_input_for_batch(
+                    session=session,
+                    title=title,
+                    payload=transition_payload,
+                    background=background,
+                    background_input_method=background_input_method,
+                )
+                last_action = STORE.record_action(
+                    "play_until_choice_transition_accelerate",
+                    {
+                        "key": game.get("control", {}).get("advance_key") or "SPACE",
+                        "input_type": extra_input_type,
+                        "wait_seconds": duration,
+                        "wait_strategy": timing["strategy"],
+                        "transition_accelerate_delay_seconds": extra_delay,
+                        "background": background,
+                        "trigger": transition_decision,
+                        **extra_input_result,
+                    },
+                    session_id=session["session_id"],
+                )
+                transition_decision["extra_click_sent"] = True
+                transition_decision["extra_click_action"] = last_action
+                transition_acceleration_count += 1
+                advance_count += 1
+                if first_after_payload.get("capture_scope") != "window_dialogue_region":
+                    # The helper samples are no longer pending after the
+                    # extra click, so count the last probe as processed too.
+                    frame_count += 1
+                if duration:
+                    time.sleep(duration)
+                try:
+                    accelerated_payload, accelerated_image_path = _capture_processed_frame(
+                        window_title=title,
+                        capture_mode=capture_mode,
+                        session=session,
+                        ocr=True,
+                        record_text=record_text,
+                        language=language,
+                        include_raw_text=include_raw_text,
+                        ocr_region=effective_ocr_region,
+                        include_image=include_image,
+                        action_event=last_action,
+                        force_full=True,
+                    )
+                    accelerated_payload, accelerated_image_path = _auto_return_from_settings(
+                        accelerated_payload,
+                        session,
+                        title=title,
+                        capture_mode=capture_mode,
+                        ocr=True,
+                        record_text=record_text,
+                        language=language,
+                        include_raw_text=include_raw_text,
+                        enabled=auto_return_from_settings,
+                        background=background,
+                        background_input_method=background_input_method,
+                        ocr_region=effective_ocr_region,
+                    )
+                except Exception as exc:
+                    internal_error = {
+                        "stage": "transition_accelerated_capture",
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "traceback": traceback.format_exc(limit=12),
+                    }
+                    stop_reason = "internal_error"
+                    break
+                final_payload, final_image_path = accelerated_payload, accelerated_image_path
+                pending_frame = (accelerated_payload, accelerated_image_path)
+
     _remember_bottom_snapshot(session, final_payload or {})
     public_final: dict[str, Any] = {}
     if final_payload is not None:
@@ -3165,11 +3987,20 @@ def play_until_choice(
             "evidence",
             "screen_type",
             "auto_recovery",
+            "ocr_focus",
+            "ocr_uncertain",
+            "advance_blocked",
         ):
             if key in final_payload:
                 public_final[key] = final_payload[key]
         if include_raw_text and final_payload.get("raw_text"):
             public_final["raw_text"] = final_payload["raw_text"]
+    response_batch = batch
+    if stop_reason == "compaction_due":
+        # The raw source is already available through get_compaction_request;
+        # returning the whole pre-compaction batch here would defeat the local
+        # token-saving design.
+        response_batch = []
     response = {
         "session_id": session["session_id"],
         "stop_reason": stop_reason,
@@ -3177,11 +4008,20 @@ def play_until_choice(
         "steps_advanced": advance_count,
         "frames_processed": frame_count,
         "settings_recoveries": settings_recoveries,
-        "batch": batch,
+        "batch": response_batch,
         "final": public_final,
         "last_action": last_action,
         "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
     }
+    compaction_status = _play_compaction_status(session["session_id"])
+    if compaction_status is not None:
+        response["compaction"] = compaction_status
+    if stop_reason == "compaction_due":
+        response["batch_omitted_for_compaction"] = {
+            "event_count": len(batch),
+            "character_count": batch_chars,
+            "reason": "use get_compaction_request instead of returning raw batch text",
+        }
     if transition_waited or transition_probe_count:
         response["transition_wait"] = {
             "budget_seconds": transition_wait,
@@ -3189,12 +4029,21 @@ def play_until_choice(
             "retry_count": transition_retry_index,
             "full_probe_attempts": transition_probe_count,
         }
+    if transition_acceleration_enabled or transition_acceleration_records:
+        response["transition_acceleration"] = {
+            "enabled": transition_acceleration_enabled,
+            "extra_clicks": transition_acceleration_count,
+            "probes": transition_acceleration_records[-8:],
+        }
     if ocr_fallback_settles:
         response["ocr_fallback_settle_seconds"] = round(ocr_fallback_settles, 3)
     response["timing"] = {
         "strategy": timing["strategy"],
         "post_click_wait_seconds": timing["post_click_wait_seconds"],
         "transition_wait_seconds": timing["transition_wait_seconds"],
+        "transition_accelerate": timing["transition_accelerate"],
+        "transition_accelerate_delay_seconds": timing["transition_accelerate_delay_seconds"],
+        "transition_probe_interval_seconds": timing["transition_probe_interval_seconds"],
         "settle_timeout_seconds": timing["settle_timeout_seconds"],
         "settle_poll_seconds": timing["settle_poll_seconds"],
         "stable_samples": timing["stable_samples"],
@@ -3221,6 +4070,7 @@ def play_until_choice(
     # blind input attempt.
     manual_intervention = stop_reason in {
         "dialogue_not_detected",
+        "ocr_uncertain",
         "ocr_unavailable",
         "timing_settle_timeout",
         "unknown_text_detected",
@@ -3234,6 +4084,8 @@ def play_until_choice(
                 else (
                     "unknown_text_detected"
                     if stop_reason == "unknown_text_detected"
+                    else "ocr_uncertain"
+                    if stop_reason == "ocr_uncertain"
                     else "ocr_frame_empty"
                 )
             ),
@@ -3538,11 +4390,11 @@ def ocr_image(
 ) -> dict[str, Any]:
     """在本地 OCR；ocr_region 只过滤识别结果，不修改原始图片。"""
 
-    full_result = native_ocr_image(image_path=image_path, language=language, psm=psm)
     try:
         image_width, image_height = _read_png_dimensions(image_path)
     except (OSError, ValueError):
         image_width = image_height = 0
+    full_result = native_ocr_image(image_path=image_path, language=language, psm=psm)
     result = _filter_ocr_result_to_region(
         full_result,
         ocr_region,
@@ -3886,6 +4738,13 @@ def _active_session_exists() -> bool:
 def main() -> None:
     """Run the server over MCP stdio, the transport used by Codex local servers."""
 
+    global STORE
+    args = _parse_server_args()
+    requested_root = Path(args.data_dir).expanduser().resolve() if args.data_dir else None
+    if requested_root is not None and requested_root != STORE.root:
+        STORE = SessionStore(root=args.data_dir)
+        _BOTTOM_SNAPSHOT_CACHE.clear()
+        _WINDOW_FULL_CAPTURE_CACHE.clear()
     mcp.run(transport="stdio")
 
 

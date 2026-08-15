@@ -1,14 +1,38 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from galgame_mcp.core import SessionStore
 
 
 class SessionStoreTests(unittest.TestCase):
+    def test_data_directory_precedence_and_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            explicit = base / "explicit"
+            environment = base / "environment"
+
+            with patch.dict(os.environ, {"GALGAME_MCP_DATA_DIR": str(environment)}):
+                from_environment = SessionStore()
+                self.assertEqual(from_environment.root, environment.resolve())
+                self.assertEqual(from_environment.root_source, "environment")
+
+                from_argument = SessionStore(explicit)
+                self.assertEqual(from_argument.root, explicit.resolve())
+                self.assertEqual(from_argument.root_source, "argument")
+
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("GALGAME_MCP_DATA_DIR", None)
+                with patch("galgame_mcp.core.Path.cwd", return_value=base):
+                    from_cwd = SessionStore()
+                self.assertEqual(from_cwd.root, (base / ".galgame_sessions").resolve())
+                self.assertEqual(from_cwd.root_source, "cwd_default")
+
     def test_record_context_export_and_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -54,11 +78,24 @@ class SessionStoreTests(unittest.TestCase):
                     "settle_poll_seconds": 0.15,
                     "stable_samples": 4,
                     "require_text_change": True,
+                    "transition_accelerate": True,
+                    "transition_accelerate_delay_seconds": 0.7,
+                    "transition_probe_interval_seconds": 0.1,
                 }
             )
             self.assertEqual(configured_timing["timing_profile"]["strategy"], "text_hash")
             self.assertEqual(configured_timing["timing_profile"]["post_click_wait_seconds"], 0.0)
+            self.assertTrue(configured_timing["timing_profile"]["transition_accelerate"])
+            self.assertEqual(
+                configured_timing["timing_profile"]["transition_accelerate_delay_seconds"],
+                0.7,
+            )
             self.assertEqual(store.get_session()["game"]["timing_profile"]["stable_samples"], 4)
+
+            configured_exact_timing = store.configure_game_timing(
+                {"strategy": "text_hash", "stable_samples": 2}
+            )
+            self.assertEqual(configured_exact_timing["timing_profile"]["strategy"], "text_hash")
 
             observation = store.record_observation(
                 raw_text="【小葵】\n今天放学后要一起回家吗？\n1. 答应\n2. 婉拒",
@@ -136,6 +173,12 @@ class SessionStoreTests(unittest.TestCase):
             source = request["request"]["source"]
             self.assertGreater(source["event_count"], 0)
 
+            frames = Path(temporary) / "compact-session" / "frames"
+            orphan_frame = frames / "orphan.png"
+            orphan_frame.parent.mkdir(parents=True, exist_ok=True)
+            orphan_frame.write_bytes(b"orphan")
+            self.assertTrue(orphan_frame.exists())
+
             saved = store.save_compaction(
                 request_id=request["request"]["request_id"],
                 summary={
@@ -154,6 +197,8 @@ class SessionStoreTests(unittest.TestCase):
             self.assertTrue(segment_path.exists())
             segment_text = segment_path.read_text(encoding="utf-8")
             self.assertNotIn("重要剧情信息。重要剧情信息。重要剧情信息。", segment_text)
+            self.assertFalse(orphan_frame.exists())
+            self.assertGreaterEqual(saved["raw_artifacts"]["frames_deleted"], 1)
 
             state = store.get_current_state("compact-session")
             self.assertEqual(state["timeline_count"], 10 - source["event_count"])

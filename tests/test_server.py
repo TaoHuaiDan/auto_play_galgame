@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -8,6 +9,7 @@ from unittest.mock import patch
 import galgame_mcp.server as server_module
 from galgame_mcp.server import (
     _capture_for_session,
+    _classify_transition_probe,
     _auto_return_from_settings,
     _batch_dialogue_item,
     _bottom_text_snapshot,
@@ -20,6 +22,8 @@ from galgame_mcp.server import (
     _choice_click_point_from_payload,
     _probe_full_window_for_choices,
     _window_center_screen_point,
+    _resolve_timing_profile,
+    _transition_probe_state,
     _wait_for_text_hash_stable,
     attach_game as server_attach_game,
     advance_game as server_advance_game,
@@ -35,6 +39,10 @@ from galgame_mcp.server import (
 
 
 class TimingProfileTests(unittest.TestCase):
+    def test_server_data_dir_argument_is_parsed(self) -> None:
+        args = server_module._parse_server_args(["--data-dir", r"D:\vn-data", "--mcp-extra"])
+        self.assertEqual(args.data_dir, r"D:\vn-data")
+
     @staticmethod
     def _frame(text: str, path: str) -> tuple[dict[str, object], Path]:
         return (
@@ -73,6 +81,84 @@ class TimingProfileTests(unittest.TestCase):
             ],
         }
         self.assertEqual(_bottom_story_hash(first), _bottom_story_hash(second))
+
+    def test_transition_probe_requires_visual_motion_not_ocr_emptiness(self) -> None:
+        stable = _classify_transition_probe(
+            [
+                {"state": "blank", "scene_change_score": 0.001},
+                {"state": "blank", "scene_change_score": 0.002, "motion_from_previous": 0.001},
+                {"state": "blank", "scene_change_score": 0.002, "motion_from_previous": 0.001},
+            ]
+        )
+        self.assertFalse(stable["confirmed"])
+        self.assertEqual(stable["status"], "ocr_uncertain")
+
+        transition = _classify_transition_probe(
+            [
+                {"state": "blank", "scene_change_score": 0.20},
+                {"state": "blank", "scene_change_score": 0.24, "motion_from_previous": 0.08},
+            ]
+        )
+        self.assertTrue(transition["confirmed"])
+        self.assertEqual(transition["status"], "transition_confirmed")
+
+    def test_transition_probe_blocks_on_text_or_choice(self) -> None:
+        story_payload = {
+            "ocr": {"available": True},
+            "processed_text": {"dialogue": "真实对白", "choices": []},
+            "_dialogue_ocr_regions": [
+                {"text": "真实对白", "y": 700, "height": 30}
+            ],
+            "height": 800,
+        }
+        choice_payload = {
+            "ocr": {"available": True},
+            "processed_text": {"dialogue": None, "choices": ["选项一"]},
+        }
+        self.assertEqual(_transition_probe_state(story_payload), "story_text")
+        self.assertEqual(_transition_probe_state(choice_payload), "choice")
+        blocked = _classify_transition_probe(
+            [{"state": "blank", "scene_change_score": 0.4}, {"state": "story_text", "scene_change_score": 0.5}]
+        )
+        self.assertFalse(blocked["confirmed"])
+        self.assertEqual(blocked["status"], "story_text")
+
+    def test_timing_profile_keeps_transition_acceleration_off_by_default(self) -> None:
+        resolved = _resolve_timing_profile({"game": {}})
+        self.assertFalse(resolved["transition_accelerate"])
+        self.assertEqual(resolved["transition_probe_interval_seconds"], 0.2)
+
+    def test_play_loop_has_no_default_step_or_batch_character_cap(self) -> None:
+        signature = inspect.signature(server_play_until_choice)
+        self.assertIsNone(signature.parameters["max_steps"].default)
+        self.assertIsNone(signature.parameters["max_batch_chars"].default)
+
+    def test_play_loop_stops_for_compaction_before_sending_input(self) -> None:
+        session = {
+            "session_id": "test-session",
+            "game": {
+                "window_title": "测试游戏",
+                "control": {"advance_key": "SPACE"},
+                "timing_profile": {"strategy": "fixed"},
+            },
+            "current_state": {},
+        }
+        with patch("galgame_mcp.server.STORE.get_session", return_value=session), patch(
+            "galgame_mcp.server.STORE.compaction_status",
+            return_value={"session_id": "test-session", "summary_due": True},
+        ), patch(
+            "galgame_mcp.server._capture_processed_frame",
+            side_effect=AssertionError("compaction must stop before capture"),
+        ), patch(
+            "galgame_mcp.server._remember_bottom_snapshot"
+        ):
+            result = server_play_until_choice(session_id="test-session")
+
+        if isinstance(result, list):
+            result = json.loads(result[0])
+        self.assertEqual(result["stop_reason"], "compaction_due")
+        self.assertEqual(result["steps_advanced"], 0)
+        self.assertTrue(result["compaction"]["summary_due"])
 
     def test_wait_for_text_hash_stable_requires_change_and_repeated_hash(self) -> None:
         first_payload, first_path = self._frame("旧台词", "C:/old.png")
@@ -857,6 +943,75 @@ class InputVerificationTests(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertGreater(result["transition_wait"]["waited_seconds"], 0)
         self.assertEqual(result["batch"][0]["dialogue"], "转场后的对白")
+
+    def test_play_until_choice_waits_through_uncertain_transition_frame(self) -> None:
+        session = {
+            "session_id": "test-session",
+            "game": {"window_title": "测试游戏", "control": {"advance_key": "SPACE"}},
+            "current_state": {},
+        }
+        frames = [
+            {
+                "ocr": {"available": True},
+                "processed_text": {"speaker": "将臣", "dialogue": "当前对白", "choices": []},
+            },
+            {
+                "ocr": {"available": True},
+                "ocr_uncertain": {"required": True},
+                "processed_text": {"speaker": None, "dialogue": "", "choices": []},
+                "evidence": {
+                    "blocking_reasons": ["dialogue_unresolved", "ocr_uncertain"],
+                    "channels": {"visual_transition": {"status": "active"}},
+                },
+            },
+            {
+                "ocr": {"available": True},
+                "processed_text": {"speaker": "将臣", "dialogue": "转场后的对白", "choices": []},
+            },
+            {
+                "ocr": {"available": True},
+                "processed_text": {"speaker": None, "dialogue": "", "choices": ["继续", "返回"]},
+            },
+        ]
+        frame_paths = [Path(f"C:/uncertain-transition-{index}.png") for index in range(len(frames))]
+        capture_index = 0
+        actions: list[dict[str, object]] = []
+
+        def capture_frame(**_kwargs: object) -> tuple[dict[str, object], Path]:
+            nonlocal capture_index
+            index = min(capture_index, len(frames) - 1)
+            capture_index += 1
+            return frames[index], frame_paths[index]
+
+        with patch("galgame_mcp.server.STORE.get_session", return_value=session), patch(
+            "galgame_mcp.server._capture_processed_frame", side_effect=capture_frame
+        ), patch(
+            "galgame_mcp.server._auto_return_from_settings",
+            side_effect=lambda payload, *_args, **_kwargs: (
+                payload,
+                Path(str(payload.get("image_path") or "C:/frame.png")),
+            ),
+        ), patch(
+            "galgame_mcp.server._advance_input_for_batch",
+            return_value=("background_click", {"queued": True}),
+        ), patch(
+            "galgame_mcp.server.STORE.record_action",
+            side_effect=lambda *args, **kwargs: actions.append({"args": args, **kwargs})
+            or {"event_id": f"action-{len(actions) + 1}"},
+        ), patch("galgame_mcp.server._remember_bottom_snapshot"):
+            result = server_play_until_choice(
+                max_steps=3,
+                wait_seconds=0,
+                transition_wait_seconds=0.25,
+                record_text=False,
+                session_id="test-session",
+            )
+
+        self.assertEqual(result["stop_reason"], "choice_detected")
+        self.assertEqual(result["steps_advanced"], 2)
+        self.assertEqual(len(actions), 2)
+        self.assertGreater(result["transition_wait"]["waited_seconds"], 0)
+        self.assertEqual(result["batch"][1]["dialogue"], "转场后的对白")
 
     def test_normalized_ocr_region_keeps_dialogue_and_excludes_ui(self) -> None:
         result = {
@@ -1707,6 +1862,141 @@ class BatchPlayTests(unittest.TestCase):
         self.assertEqual(result["batch"][1]["choices"], ["继续", "返回"])
         self.assertEqual(capture.call_count, 2)
         advance.assert_called_once()
+
+    def test_unresolved_full_ocr_requests_visual_review(self) -> None:
+        profile = {
+            "dialogue_region": {
+                "x": 0.10,
+                "y": 0.70,
+                "width": 0.80,
+                "height": 0.25,
+                "coordinate_space": "normalized",
+            },
+            "speaker_markers": [{"open": "【", "close": "】"}],
+            "dialogue_markers": [{"open": "「", "close": "」"}],
+        }
+        payload = {
+            "capture_scope": "window_full",
+            "width": 1000,
+            "height": 800,
+            "window": {"x": 0, "y": 0, "width": 1000, "height": 800},
+        }
+        session = {
+            "session_id": "test-session",
+            "current_state": {},
+            "game": {"layout_profile": profile},
+        }
+        primary = {
+            "available": True,
+            "status": "ok",
+            "backend": "windows_ocr",
+            "text": "SAVE LOAD SYSTEM",
+            "regions": [{"text": "SAVE LOAD SYSTEM", "x": 100, "y": 700, "width": 200, "height": 24}],
+        }
+        focused = {
+            "available": True,
+            "status": "empty",
+            "backend": "focused_ocr",
+            "text": "",
+            "regions": [],
+            "attempts": [{"label": "dialogue", "status": "empty"}],
+        }
+        with patch("galgame_mcp.server.native_ocr_image", return_value=primary), patch(
+            "galgame_mcp.server.native_focused_ocr_image", return_value=focused
+        ) as focused_call:
+            processed = _process_local_text(
+                payload,
+                Path("C:/full.png"),
+                session,
+                ocr=True,
+                record_text=False,
+                language="auto",
+                include_raw_text=True,
+                ocr_region=profile["dialogue_region"],
+            )
+
+        self.assertTrue(processed["ocr_uncertain"]["required"])
+        self.assertEqual(processed["ocr_uncertain"]["status"], "needs_codex_visual_review")
+        self.assertIn("ocr_uncertain", processed["evidence"]["blocking_reasons"])
+        focused_call.assert_called_once()
+        self.assertEqual(focused_call.call_args.args[1][0]["label"], "dialogue")
+        self.assertEqual(processed["ocr_focus"]["mode"], "profile_region_zoom")
+
+    def test_focused_ocr_can_recover_a_short_punctuation_line(self) -> None:
+        profile = {
+            "dialogue_region": {
+                "x": 0.10,
+                "y": 0.70,
+                "width": 0.80,
+                "height": 0.25,
+                "coordinate_space": "normalized",
+            },
+            "speaker_markers": [{"open": "【", "close": "】"}],
+            "dialogue_markers": [{"open": "「", "close": "」"}],
+        }
+        payload = {
+            "capture_scope": "window_full",
+            "width": 1000,
+            "height": 800,
+            "window": {"x": 0, "y": 0, "width": 1000, "height": 800},
+        }
+        session = {
+            "session_id": "test-session",
+            "current_state": {},
+            "game": {"layout_profile": profile},
+        }
+        primary = {
+            "available": True,
+            "status": "ok",
+            "backend": "windows_ocr",
+            "text": "SAVE LOAD SYSTEM",
+            "regions": [{"text": "SAVE LOAD SYSTEM", "x": 100, "y": 700, "width": 200, "height": 24}],
+        }
+        focused = {
+            "available": True,
+            "status": "ok",
+            "backend": "focused_ocr",
+            "text": "【七海&晓】\n「……」",
+            "regions": [
+                {"text": "【七海&晓】", "x": 300, "y": 580, "width": 150, "height": 32},
+                {"text": "「……」", "x": 300, "y": 640, "width": 180, "height": 36},
+            ],
+            "scale": 2.0,
+            "attempts": [{"label": "dialogue", "status": "ok"}],
+        }
+        with patch("galgame_mcp.server.native_ocr_image", return_value=primary), patch(
+            "galgame_mcp.server.native_focused_ocr_image", return_value=focused
+        ):
+            processed = _process_local_text(
+                payload,
+                Path("C:/full.png"),
+                session,
+                ocr=True,
+                record_text=False,
+                language="auto",
+                include_raw_text=True,
+                ocr_region=profile["dialogue_region"],
+            )
+
+        self.assertEqual(processed["processed_text"]["speaker"], "七海&晓")
+        self.assertEqual(processed["processed_text"]["dialogue"], "「……」")
+        self.assertNotIn("ocr_uncertain", processed)
+        self.assertEqual(processed["ocr_focus"]["mode"], "profile_region_zoom")
+
+    def test_batch_keeps_recognized_punctuation_only_dialogue(self) -> None:
+        item = _batch_dialogue_item(
+            {
+                "processed_text": {
+                    "speaker": "七海&晓",
+                    "dialogue": "「……」",
+                    "choices": [],
+                    "text_status": "recognized",
+                }
+            },
+            1,
+        )
+        self.assertIsNotNone(item)
+        self.assertEqual(item["dialogue"], "「……」")
 
 if __name__ == "__main__":
     unittest.main()

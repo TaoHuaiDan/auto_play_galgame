@@ -8,6 +8,9 @@ licenses.
   License.
 - [PyWinRT](https://github.com/pywinrt/pywinrt), used through the modular
   `winrt-Windows.*` packages for Windows OCR — MIT License.
+- [Pillow](https://python-pillow.org/), an optional local crop/scale dependency
+  for the second focused OCR pass. It is installed separately and is not
+  vendored.
 - Tesseract, when installed separately by a user, is an optional system OCR
   executable and is not distributed by this project.
 
