@@ -110,10 +110,10 @@ def _looks_like_ui_residue(
         ui_hits = max(ui_hits, 1)
     if ui_hits >= 2 and cjk_count <= 3:
         return True
-    if any(char in stripped for char in _STORY_PUNCTUATION + "「『【《〈"):
-        return False
     if ui_hits >= 1 and len(compact) <= 24 and cjk_count <= 2:
         return True
+    if any(char in stripped for char in _STORY_PUNCTUATION + "「『【《〈"):
+        return False
     # Conservative fallback for mixed short OCR fragments such as ``Levy9``
     # or ``V创0``.  Do not classify a plain short English sentence such as
     # ``yes`` as UI: that is a legitimate line in another visual novel.
