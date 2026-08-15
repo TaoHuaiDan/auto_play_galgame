@@ -223,6 +223,17 @@ class TextParserTests(unittest.TestCase):
         self.assertEqual(parsed["dialogue"], "yes")
         self.assertEqual(parsed["text_status"], "recognized")
 
+    def test_configured_marker_profile_does_not_guess_unmarked_colon_ui(self) -> None:
+        parsed = parse_screen_text(
+            "0」RIDDLE」OKER: C Search for RiddIe",
+            layout_profile=MARKER_PROFILE,
+        )
+
+        self.assertIsNone(parsed["speaker"])
+        self.assertEqual(parsed["dialogue"], "")
+        self.assertEqual(parsed["text_status"], "unknown")
+        self.assertEqual(parsed["unknown_lines"], ["0」RIDDLE」OKER: C Search for RiddIe"])
+
 
 if __name__ == "__main__":
     unittest.main()

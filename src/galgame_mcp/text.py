@@ -668,7 +668,10 @@ def parse_screen_text(
                 speaker, remainder = layout_name
                 explicit_speaker = True
                 if remainder:
-                    dialogue_lines.append(remainder)
+                    if _looks_like_ui_residue(remainder, profile):
+                        ui_lines.append(remainder)
+                    else:
+                        dialogue_lines.append(remainder)
                 continue
             # A configured dialogue opener has priority over an ambiguous
             # speaker marker. If a game uses the same pair for both roles, it
@@ -679,10 +682,24 @@ def parse_screen_text(
             colon_match = _COLON_SPEAKER.match(line)
             if colon_match:
                 candidate = colon_match.group("speaker").strip()
-                if len(candidate) <= 20 and not any(char in candidate for char in "，。！？,.!?"):
+                candidate_is_residue = _looks_like_ui_residue(candidate, profile)
+                if (
+                    len(candidate) <= 20
+                    and not any(char in candidate for char in "，。！？,.!?")
+                    and not candidate_is_residue
+                    and not speaker_markers
+                ):
                     speaker = candidate
                     explicit_speaker = True
                     dialogue_lines.append(colon_match.group("text").strip())
+                    continue
+                if speaker_markers:
+                    # Once a game has a configured name-box profile, an
+                    # unmarked ``name: text`` line is safer as unresolved OCR
+                    # than as a guessed speaker.  This prevents logos or
+                    # chapter labels from becoming structured dialogue.
+                    unparsed_lines.append(line)
+                    unknown_lines.append(line)
                     continue
 
         if _starts_with_marker(line, speaker_markers) and not explicit_speaker:
