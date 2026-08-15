@@ -30,6 +30,19 @@ async def _protocol_smoke(data_dir: str) -> tuple[set[str], bool, bool, bool]:
             listed = await session.list_tools()
             names = {tool.name for tool in listed.tools}
             started = await session.call_tool("start_session", {"game_name": "协议测试"})
+            configured = await session.call_tool(
+                "configure_game_layout",
+                {
+                    "profile": {
+                        "speaker_markers": [{"open": "<N>", "close": "</N>"}],
+                        "dialogue_markers": [{"open": "<T>", "close": "</T>"}],
+                    }
+                },
+            )
+            timing_configured = await session.call_tool(
+                "configure_game_timing",
+                {"profile": {"strategy": "text_hash", "stable_samples": 2}},
+            )
             context = await session.call_tool("get_codex_context", {"recent_events": 5})
             captured = await session.call_tool(
                 "capture_screen",
@@ -37,10 +50,19 @@ async def _protocol_smoke(data_dir: str) -> tuple[set[str], bool, bool, bool]:
             )
             parsed = await session.call_tool(
                 "parse_text",
-                {"raw_text": "【小葵】\n今日は一緒に帰らない？\n1. はい\n2. いいえ"},
+                {"raw_text": "<N>小葵</N>\n<T>今日は一緒に帰らない？</T>"},
             )
             has_image = any(getattr(block, "type", None) == "image" for block in captured.content)
-            return names, not started.isError, not context.isError and not parsed.isError and not captured.isError, has_image
+            return (
+                names,
+                not started.isError,
+                not configured.isError
+                and not timing_configured.isError
+                and not context.isError
+                and not parsed.isError
+                and not captured.isError,
+                has_image,
+            )
 
 
 class ProtocolTests(unittest.TestCase):
@@ -51,7 +73,21 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(context_ok)
         self.assertTrue(image_ok)
         self.assertTrue(
-            {"start_session", "record_observation", "parse_text", "record_parsed_text", "capture_screen", "get_codex_context"}
+            {
+                "start_session",
+                "record_observation",
+                "parse_text",
+                "record_parsed_text",
+                "configure_game_layout",
+                "configure_game_actions",
+                "configure_game_timing",
+                "perform_game_action",
+                "capture_screen",
+                "get_codex_context",
+                "get_compaction_status",
+                "get_compaction_request",
+                "save_compaction",
+            }
             <= names
         )
 

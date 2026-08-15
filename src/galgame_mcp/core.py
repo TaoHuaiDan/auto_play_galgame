@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -32,6 +34,245 @@ def _clean_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _normalise_noise_flags(flags: Any) -> list[dict[str, Any]]:
+    """Keep bounded, JSON-safe OCR hints alongside the raw observation."""
+
+    if flags is None:
+        return []
+    if not isinstance(flags, (list, tuple)):
+        raise SessionError("noise_flags 必须是数组")
+    normalised: list[dict[str, Any]] = []
+    for item in flags[:32]:
+        if not isinstance(item, dict):
+            continue
+        code = _clean_text(item.get("code"))
+        if not code:
+            continue
+        try:
+            line = int(item.get("line", 0))
+        except (TypeError, ValueError):
+            line = 0
+        normalised.append(
+            {
+                "code": code[:64],
+                "severity": (_clean_text(item.get("severity")) or "low")[:16],
+                "line": max(0, line),
+                "text": (_clean_text(item.get("text")) or "")[:160],
+                "reason": (_clean_text(item.get("reason")) or "")[:240],
+            }
+        )
+    return normalised
+
+
+def _normalise_layout_profile(profile: Any) -> dict[str, Any]:
+    """Validate the JSON-friendly per-game OCR/layout configuration."""
+
+    if not isinstance(profile, dict):
+        raise SessionError("layout_profile 必须是 JSON 对象；传空对象可清除配置")
+    try:
+        copied = copy.deepcopy(profile)
+        encoded = json.dumps(copied, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise SessionError("layout_profile 必须只包含 JSON 可序列化值") from exc
+    if len(encoded) > 100_000:
+        raise SessionError("layout_profile 过大，不能超过 100000 个字符")
+
+    region_names = {"dialogue_region", "speaker_region", "choice_region"}
+    for name in region_names:
+        region = copied.get(name)
+        if region is None:
+            continue
+        if not isinstance(region, dict):
+            raise SessionError(f"layout_profile.{name} 必须是包含 x、y、width、height 的对象")
+        try:
+            values = [float(region[key]) for key in ("x", "y", "width", "height")]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SessionError(f"layout_profile.{name} 必须包含数字 x、y、width、height") from exc
+        if not all(math.isfinite(value) for value in values):
+            raise SessionError(f"layout_profile.{name} 不能包含 NaN 或无穷大")
+        default_space = "dialogue_region" if name == "speaker_region" else "normalized"
+        coordinate_space = str(region.get("coordinate_space") or default_space).strip().casefold()
+        allowed_spaces = {"normalized", "normalised", "relative", "fraction", "pixels", "pixel", "absolute"}
+        if name == "speaker_region":
+            allowed_spaces |= {"dialogue_region", "dialogue_box", "image"}
+        if coordinate_space not in allowed_spaces:
+            raise SessionError(
+                f"layout_profile.{name}.coordinate_space 不受支持: {coordinate_space}"
+            )
+        if coordinate_space in {"normalized", "normalised", "relative", "fraction", "dialogue_region", "dialogue_box"}:
+            if any(value < 0 or value > 1 for value in values):
+                raise SessionError(f"layout_profile.{name} 的 normalized 坐标和尺寸必须在 0 到 1 之间")
+        elif any(value < 0 for value in values):
+            raise SessionError(f"layout_profile.{name} 的 pixels 坐标和尺寸不能为负数")
+        region["coordinate_space"] = coordinate_space
+
+    for key in ("speaker_markers", "dialogue_markers"):
+        markers = copied.get(key)
+        if markers is None:
+            continue
+        if isinstance(markers, dict):
+            markers = [markers]
+            copied[key] = markers
+        if not isinstance(markers, list) or len(markers) > 64:
+            raise SessionError(f"layout_profile.{key} 必须是最多 64 项的数组")
+        normalised_markers: list[dict[str, Any]] = []
+        for marker in markers:
+            if isinstance(marker, (list, tuple)) and len(marker) >= 2:
+                marker = {
+                    "open": marker[0],
+                    "close": marker[1],
+                    "allow_unclosed": bool(marker[2]) if len(marker) >= 3 else False,
+                }
+            if not isinstance(marker, dict):
+                raise SessionError(f"layout_profile.{key} 的每项必须是对象或二元数组")
+            opener = _clean_text(marker.get("open") or marker.get("opener"))
+            closer = _clean_text(marker.get("close") or marker.get("closer")) or ""
+            if not opener:
+                raise SessionError(f"layout_profile.{key} 的 marker.open 不能为空")
+            if len(opener) > 16 or len(closer) > 16:
+                raise SessionError(f"layout_profile.{key} 的 marker 符号长度不能超过 16")
+            normalised_markers.append(
+                {
+                    "open": opener,
+                    "close": closer,
+                    "allow_unclosed": bool(marker.get("allow_unclosed", False)),
+                }
+            )
+        copied[key] = normalised_markers
+
+    for key in ("choice_min_count", "speaker_max_chars"):
+        if key in copied:
+            try:
+                number = int(copied[key])
+            except (TypeError, ValueError) as exc:
+                raise SessionError(f"layout_profile.{key} 必须是整数") from exc
+            limits = {"choice_min_count": (2, 10), "speaker_max_chars": (1, 200)}
+            minimum, maximum = limits[key]
+            if not minimum <= number <= maximum:
+                raise SessionError(f"layout_profile.{key} 必须在 {minimum} 到 {maximum} 之间")
+            copied[key] = number
+    for key in ("choice_min_height_ratio",):
+        if key in copied:
+            try:
+                number = float(copied[key])
+            except (TypeError, ValueError) as exc:
+                raise SessionError(f"layout_profile.{key} 必须是数字") from exc
+            if not math.isfinite(number) or not 0 <= number <= 1:
+                raise SessionError(f"layout_profile.{key} 必须在 0 到 1 之间")
+            copied[key] = number
+    for key in ("choice_detection_on_crops",):
+        if key in copied and not isinstance(copied[key], bool):
+            raise SessionError(f"layout_profile.{key} 必须是布尔值")
+    if "choice_layout" in copied:
+        choice_layout = str(copied["choice_layout"]).strip().casefold()
+        if choice_layout not in {"vertical", "horizontal", "both"}:
+            raise SessionError("layout_profile.choice_layout 必须是 vertical、horizontal 或 both")
+        copied["choice_layout"] = choice_layout
+    return copied
+
+
+def _normalise_action_profile(profile: Any) -> dict[str, dict[str, Any]]:
+    """Validate JSON-friendly named game actions without hard-coding a title."""
+
+    if not isinstance(profile, dict):
+        raise SessionError("action_profile 必须是 JSON 对象；传空对象可清除配置")
+    try:
+        copied = copy.deepcopy(profile)
+        encoded = json.dumps(copied, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise SessionError("action_profile 必须只包含 JSON 可序列化值") from exc
+    if len(encoded) > 100_000:
+        raise SessionError("action_profile 过大，不能超过 100000 个字符")
+    if len(copied) > 64:
+        raise SessionError("action_profile 最多支持 64 个命名动作")
+
+    allowed_kinds = {"click", "key", "scroll", "hold", "wait", "focus"}
+    normalised: dict[str, dict[str, Any]] = {}
+    for name, value in copied.items():
+        action_name = _clean_text(name)
+        if not action_name or len(action_name) > 64:
+            raise SessionError("action_profile 的动作名称必须是 1-64 个字符")
+        if isinstance(value, str):
+            value = {"kind": value}
+        if not isinstance(value, dict):
+            raise SessionError(f"action_profile.{action_name} 必须是对象或动作类型字符串")
+        spec = copy.deepcopy(value)
+        kind = _clean_text(spec.get("kind") or spec.get("type"))
+        if not kind or kind.casefold() not in allowed_kinds:
+            raise SessionError(
+                f"action_profile.{action_name}.kind 必须是 click、key、scroll、hold、wait 或 focus"
+            )
+        spec["kind"] = kind.casefold()
+        if "delivery" in spec:
+            delivery = _clean_text(spec["delivery"]) or "send"
+            if delivery.casefold() not in {"post", "send"}:
+                raise SessionError(f"action_profile.{action_name}.delivery 必须是 post 或 send")
+            spec["delivery"] = delivery.casefold()
+        if "button" in spec:
+            button = _clean_text(spec["button"]) or "left"
+            if button.casefold() not in {"left", "right", "middle"}:
+                raise SessionError(f"action_profile.{action_name}.button 必须是 left、right 或 middle")
+            spec["button"] = button.casefold()
+        if "target" in spec:
+            target = _clean_text(spec["target"])
+            if target is None:
+                raise SessionError(f"action_profile.{action_name}.target 不能为空")
+            spec["target"] = target.casefold()
+        normalised[action_name] = spec
+    return normalised
+
+
+def _normalise_timing_profile(profile: Any) -> dict[str, Any]:
+    """Validate per-game post-input settling and typewriter timing."""
+
+    if not isinstance(profile, dict):
+        raise SessionError("timing_profile 必须是 JSON 对象；传空对象可清除配置")
+    try:
+        copied = copy.deepcopy(profile)
+        encoded = json.dumps(copied, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise SessionError("timing_profile 必须只包含 JSON 可序列化值") from exc
+    if len(encoded) > 20_000:
+        raise SessionError("timing_profile 过大，不能超过 20000 个字符")
+    if not copied:
+        return {}
+
+    strategy = str(copied.get("strategy") or "fixed").strip().casefold()
+    aliases = {"fixed", "text_hash", "hash", "hash_stable", "adaptive"}
+    if strategy not in aliases:
+        raise SessionError("timing_profile.strategy 必须是 fixed 或 text_hash")
+    copied["strategy"] = "text_hash" if strategy in {"hash", "hash_stable", "adaptive"} else "fixed"
+
+    float_limits = {
+        "post_click_wait_seconds": (0.0, 10.0),
+        "transition_wait_seconds": (0.0, 10.0),
+        "settle_timeout_seconds": (0.0, 30.0),
+        "settle_poll_seconds": (0.02, 2.0),
+    }
+    for key, (minimum, maximum) in float_limits.items():
+        if key not in copied:
+            continue
+        try:
+            value = float(copied[key])
+        except (TypeError, ValueError) as exc:
+            raise SessionError(f"timing_profile.{key} 必须是数字") from exc
+        if not math.isfinite(value):
+            raise SessionError(f"timing_profile.{key} 不能是 NaN 或无穷大")
+        copied[key] = max(minimum, min(value, maximum))
+
+    if "stable_samples" in copied:
+        try:
+            samples = int(copied["stable_samples"])
+        except (TypeError, ValueError) as exc:
+            raise SessionError("timing_profile.stable_samples 必须是整数") from exc
+        if not 1 <= samples <= 10:
+            raise SessionError("timing_profile.stable_samples 必须在 1 到 10 之间")
+        copied["stable_samples"] = samples
+    if "require_text_change" in copied and not isinstance(copied["require_text_change"], bool):
+        raise SessionError("timing_profile.require_text_change 必须是布尔值")
+    return copied
 
 
 def _normalise_options(options: Iterable[Any] | None) -> list[dict[str, Any]]:
@@ -91,19 +332,58 @@ def _coerce_story_value(value: str, value_type: str) -> Any:
 
 
 class SessionStore:
-    """Small, crash-tolerant JSON event store for visual-novel sessions.
+    """Small, crash-tolerant event store for visual-novel sessions.
 
-    Each session is a directory containing ``session.json`` and optional assets.
-    The session file is rewritten atomically after every mutating operation, so a
-    Codex run can be interrupted and resumed without losing the previous turn.
+    Each session is a directory containing a compact ``session.json`` checkpoint
+    and an append-only ``events.jsonl`` journal.  Older sessions that still keep
+    their complete timeline inline are migrated on the next write.  Keeping the
+    checkpoint small is important here: autoplay can create several events per
+    screen, and rewriting an ever-growing JSON document made long runs slower
+    until they eventually timed out.
     """
 
-    def __init__(self, root: str | Path | None = None):
+    def __init__(
+        self,
+        root: str | Path | None = None,
+        compaction_threshold_bytes: int | None = None,
+        compaction_keep_recent_events: int | None = None,
+    ):
         configured_root = root or os.environ.get("GALGAME_MCP_DATA_DIR")
         self.root = Path(configured_root or (Path.cwd() / ".galgame_sessions")).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self._active_file = self.root / "active_session.txt"
         self._lock = threading.RLock()
+        # A play_until_choice batch can touch the same session hundreds of
+        # times.  Keep the hydrated timeline in memory and only re-read files
+        # when another process actually changes the checkpoint or journal.
+        self._session_cache: dict[str, dict[str, Any]] = {}
+        self._session_cache_signatures: dict[str, tuple[Any, Any]] = {}
+        self.compaction_threshold_bytes = self._bounded_compaction_threshold(
+            compaction_threshold_bytes
+            if compaction_threshold_bytes is not None
+            else os.environ.get("GALGAME_MCP_COMPACTION_THRESHOLD_BYTES", 256_000)
+        )
+        self.compaction_keep_recent_events = self._bounded_compaction_keep_recent_events(
+            compaction_keep_recent_events
+            if compaction_keep_recent_events is not None
+            else os.environ.get("GALGAME_MCP_COMPACTION_KEEP_RECENT_EVENTS", 24)
+        )
+
+    @staticmethod
+    def _bounded_compaction_threshold(value: Any) -> int:
+        try:
+            threshold = int(value)
+        except (TypeError, ValueError) as exc:
+            raise SessionError("compaction_threshold_bytes 必须是整数") from exc
+        return max(16_384, min(threshold, 50_000_000))
+
+    @staticmethod
+    def _bounded_compaction_keep_recent_events(value: Any) -> int:
+        try:
+            keep = int(value)
+        except (TypeError, ValueError) as exc:
+            raise SessionError("compaction_keep_recent_events 必须是整数") from exc
+        return max(4, min(keep, 500))
 
     # ---------- paths and persistence ----------
 
@@ -122,6 +402,11 @@ class SessionStore:
     def session_path(self, session_id: str) -> Path:
         return self.session_dir(session_id) / "session.json"
 
+    def event_journal_path(self, session_id: str) -> Path:
+        """Return the per-session append-only event journal path."""
+
+        return self.session_dir(session_id) / "events.jsonl"
+
     def _active_id_locked(self) -> str | None:
         try:
             value = self._active_file.read_text(encoding="utf-8").strip()
@@ -135,26 +420,262 @@ class SessionStore:
             return
         self._active_file.write_text(session_id, encoding="utf-8")
 
+    @staticmethod
+    def _event_seq(event: dict[str, Any]) -> int:
+        try:
+            return int(event.get("seq", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _event_identity(cls, event: dict[str, Any]) -> tuple[str, str]:
+        event_id = event.get("event_id")
+        if event_id:
+            return ("event_id", str(event_id))
+        seq = cls._event_seq(event)
+        if seq:
+            return ("seq", str(seq))
+        return (
+            "content",
+            json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        )
+
+    @classmethod
+    def _merge_timeline(
+        cls,
+        inline_events: Iterable[Any],
+        journal_events: Iterable[Any],
+        compacted_through_seq: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Merge legacy inline events and journal rows without duplicates."""
+
+        merged: dict[tuple[str, str], dict[str, Any]] = {}
+        for candidate in [*inline_events, *journal_events]:
+            if not isinstance(candidate, dict):
+                continue
+            identity = cls._event_identity(candidate)
+            merged.setdefault(identity, candidate)
+        result = sorted(
+            merged.values(),
+            key=lambda event: (cls._event_seq(event), str(event.get("created_at", ""))),
+        )
+        return [
+            event
+            for event in result
+            if cls._event_seq(event) > int(compacted_through_seq or 0)
+        ]
+
+    def _read_event_journal_locked(self, session_id: str) -> list[dict[str, Any]]:
+        path = self.event_journal_path(session_id)
+        if not path.exists():
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise SessionError(f"无法读取事件日志: {path}: {exc}") from exc
+        events: list[dict[str, Any]] = []
+        for index, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                # A process can be interrupted halfway through the final JSONL
+                # row.  Earlier complete rows remain usable; reject corruption
+                # in the middle of the journal instead of silently losing it.
+                if index == len(lines) - 1:
+                    continue
+                raise SessionError(
+                    f"事件日志损坏: {path} 第 {index + 1} 行: {exc.msg}"
+                ) from exc
+            if isinstance(value, dict):
+                events.append(value)
+        return events
+
+    @staticmethod
+    def _file_signature(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (int(stat.st_mtime_ns), int(stat.st_size))
+
+    def _storage_signature_locked(self, session_id: str) -> tuple[Any, Any]:
+        return (
+            self._file_signature(self.session_path(session_id)),
+            self._file_signature(self.event_journal_path(session_id)),
+        )
+
+    def _hydrate_timeline_locked(self, session: dict[str, Any]) -> dict[str, Any]:
+        """Load journal rows into the in-memory session representation."""
+
+        session_id = self.validate_session_id(str(session.get("session_id", "")))
+        inline_events = session.get("timeline")
+        if not isinstance(inline_events, list):
+            inline_events = []
+        journal_path = self.event_journal_path(session_id)
+        journal_exists = journal_path.exists()
+        journal_events = self._read_event_journal_locked(session_id)
+        storage = session.get("storage")
+        if not isinstance(storage, dict):
+            storage = {}
+            session["storage"] = storage
+        mode = str(storage.get("mode") or "")
+        try:
+            journaled_through_seq = int(storage.get("journaled_through_seq", 0))
+        except (TypeError, ValueError):
+            journaled_through_seq = 0
+        if mode == "event_journal" and journaled_through_seq > 0 and not journal_exists:
+            raise SessionError(f"会话事件日志缺失: {journal_path}")
+
+        compaction = session.get("compaction")
+        compacted_through_seq = 0
+        if isinstance(compaction, dict):
+            try:
+                compacted_through_seq = int(compaction.get("compacted_through_seq", 0))
+            except (TypeError, ValueError):
+                compacted_through_seq = 0
+        session["timeline"] = self._merge_timeline(
+            inline_events,
+            journal_events,
+            compacted_through_seq=compacted_through_seq,
+        )
+        journal_max_seq = max((self._event_seq(event) for event in journal_events), default=0)
+        storage.update(
+            {
+                "mode": "event_journal",
+                "journal_filename": "events.jsonl",
+                "journaled_through_seq": max(journaled_through_seq, journal_max_seq),
+                # Legacy inline sessions need one seed write.  If a journal is
+                # already present, its rows are authoritative for the prefix.
+                "journal_needs_seed": bool(inline_events) and not journal_events,
+            }
+        )
+        return session
+
+    def _append_journal_locked(
+        self,
+        session: dict[str, Any],
+        events: Iterable[dict[str, Any]],
+    ) -> int:
+        rows = [event for event in events if isinstance(event, dict)]
+        if not rows:
+            return 0
+        path = self.event_journal_path(session["session_id"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                for event in rows:
+                    handle.write(
+                        json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+                        + "\n"
+                    )
+                handle.flush()
+                # The checkpoint is written only after the journal is durable.
+                # One fsync per MCP mutation is considerably cheaper than
+                # rewriting the complete session document on every event.
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            raise SessionError(f"无法追加事件日志: {path}: {exc}") from exc
+        return max((self._event_seq(event) for event in rows), default=0)
+
+    def _rewrite_journal_locked(self, session: dict[str, Any]) -> None:
+        """Atomically rewrite the journal after a validated compaction purge."""
+
+        path = self.event_journal_path(session["session_id"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                for event in session.get("timeline", []):
+                    handle.write(
+                        json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+                        + "\n"
+                    )
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(path)
+        except OSError as exc:
+            temporary.unlink(missing_ok=True)
+            raise SessionError(f"无法重写事件日志: {path}: {exc}") from exc
+        storage = session.setdefault("storage", {})
+        storage.update(
+            {
+                "mode": "event_journal",
+                "journal_filename": "events.jsonl",
+                "journaled_through_seq": max(
+                    (self._event_seq(event) for event in session.get("timeline", [])),
+                    default=0,
+                ),
+                "journal_needs_seed": False,
+            }
+        )
+
     def _load_locked(self, session_id: str) -> dict[str, Any]:
         path = self.session_path(session_id)
         if not path.exists():
             raise SessionError(f"找不到会话: {session_id}")
+        session_id = self.validate_session_id(session_id)
+        signature = self._storage_signature_locked(session_id)
+        cached = self._session_cache.get(session_id)
+        if cached is not None and self._session_cache_signatures.get(session_id) == signature:
+            return cached
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            session = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise SessionError(f"会话文件损坏: {path}: {exc.msg}") from exc
+        if not isinstance(session, dict):
+            raise SessionError(f"会话文件格式无效: {path}")
+        hydrated = self._hydrate_timeline_locked(session)
+        self._session_cache[session_id] = hydrated
+        self._session_cache_signatures[session_id] = self._storage_signature_locked(session_id)
+        return hydrated
 
     def _save_locked(self, session: dict[str, Any]) -> None:
         session["updated_at"] = utc_now()
         directory = self.session_dir(session["session_id"])
         directory.mkdir(parents=True, exist_ok=True)
+        storage = session.setdefault("storage", {})
+        if not isinstance(storage, dict):
+            storage = {}
+            session["storage"] = storage
+        storage.setdefault("mode", "event_journal")
+        storage.setdefault("journal_filename", "events.jsonl")
+        try:
+            journaled_through_seq = int(storage.get("journaled_through_seq", 0))
+        except (TypeError, ValueError):
+            journaled_through_seq = 0
+        timeline = [event for event in session.get("timeline", []) if isinstance(event, dict)]
+        if storage.get("journal_needs_seed"):
+            self._rewrite_journal_locked(session)
+        else:
+            pending = [
+                event
+                for event in timeline
+                if self._event_seq(event) > journaled_through_seq
+            ]
+            if pending:
+                journaled_through_seq = self._append_journal_locked(session, pending)
+                storage["journaled_through_seq"] = max(
+                    journaled_through_seq,
+                    int(storage.get("journaled_through_seq", 0) or 0),
+                )
+        storage["journal_needs_seed"] = False
+
+        # The complete timeline remains available in memory and is rebuilt from
+        # events.jsonl on load.  Only the small mutable checkpoint is serialized.
+        checkpoint = dict(session)
+        checkpoint["timeline"] = []
         target = directory / "session.json"
         temporary = directory / "session.json.tmp"
         temporary.write_text(
-            json.dumps(session, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
         temporary.replace(target)
+        session_id = self.validate_session_id(str(session["session_id"]))
+        self._session_cache[session_id] = session
+        self._session_cache_signatures[session_id] = self._storage_signature_locked(session_id)
 
     def _require_locked(self, session_id: str | None = None) -> dict[str, Any]:
         target = session_id or self._active_id_locked()
@@ -187,7 +708,23 @@ class SessionStore:
                     "name": game_name,
                     "window_title": None,
                     "executable": None,
-                    "control": {"advance_key": "SPACE", "choice_mode": "number"},
+                    "control": {
+                        "advance_key": "SPACE",
+                        "advance_hold_seconds": 0.0,
+                        "choice_mode": "number",
+                    },
+                    # Empty means generic parsing. Game-specific markers and
+                    # fixed regions are supplied later through the MCP layout
+                    # configuration tool and persisted with this session.
+                    "layout_profile": {},
+                    # Named input actions are optional and deliberately kept
+                    # separate from OCR/layout settings so each game can map
+                    # actions such as hide_ui or return_game independently.
+                    "action_profile": {},
+                    # Timing is also per-game: a typewriter VN can opt into
+                    # local text-hash settling without slowing fixed-timing
+                    # games such as the current 千恋＊万花 profile.
+                    "timing_profile": {},
                 },
                 "created_at": now,
                 "updated_at": now,
@@ -205,6 +742,15 @@ class SessionStore:
                 "timeline": [],
                 "choices": [],
                 "metadata": metadata or {},
+                "compaction": {
+                    "schema_version": "1.0",
+                    "threshold_bytes": self.compaction_threshold_bytes,
+                    "keep_recent_events": self.compaction_keep_recent_events,
+                    "next_seq": 1,
+                    "compacted_through_seq": 0,
+                    "segments": [],
+                    "pending": None,
+                },
             }
             self._save_locked(session)
             self.session_dir(session_id).joinpath("frames").mkdir(exist_ok=True)
@@ -216,8 +762,9 @@ class SessionStore:
             summaries = []
             for path in self.root.glob("*/session.json"):
                 try:
-                    summaries.append(self._summary(json.loads(path.read_text(encoding="utf-8"))))
-                except (OSError, json.JSONDecodeError, KeyError, TypeError):
+                    session_id = path.parent.name
+                    summaries.append(self._summary(self._load_locked(session_id)))
+                except (OSError, SessionError, json.JSONDecodeError, KeyError, TypeError):
                     continue
             summaries.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
             return summaries[: max(1, min(int(limit), 100))]
@@ -236,6 +783,7 @@ class SessionStore:
         window_title: str | None = None,
         executable: str | None = None,
         advance_key: str | None = None,
+        advance_hold_seconds: float | None = None,
         choice_mode: str | None = None,
         session_id: str | None = None,
     ) -> dict[str, Any]:
@@ -251,6 +799,12 @@ class SessionStore:
                 game["executable"] = _clean_text(executable)
             if advance_key is not None:
                 control["advance_key"] = _clean_text(advance_key) or "SPACE"
+            if advance_hold_seconds is not None:
+                try:
+                    duration = float(advance_hold_seconds)
+                except (TypeError, ValueError) as exc:
+                    raise SessionError("advance_hold_seconds 必须是数字") from exc
+                control["advance_hold_seconds"] = max(0.0, min(duration, 30.0))
             if choice_mode is not None:
                 mode = choice_mode.strip().lower()
                 if mode not in {"number", "arrow", "click", "key"}:
@@ -263,6 +817,78 @@ class SessionStore:
             )
             self._save_locked(session)
             return {"game": copy.deepcopy(game), "event": event}
+
+    def configure_game_layout(
+        self,
+        profile: dict[str, Any],
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist the active game's OCR markers and fixed screen regions."""
+
+        normalised = _normalise_layout_profile(profile)
+        with self._lock:
+            session = self._require_locked(session_id)
+            game = session.setdefault("game", {})
+            game["layout_profile"] = normalised
+            event = self._append_event_locked(
+                session,
+                "game_layout_configured",
+                {"layout_profile": copy.deepcopy(normalised)},
+            )
+            self._save_locked(session)
+            return {
+                "session_id": session["session_id"],
+                "layout_profile": copy.deepcopy(normalised),
+                "event": event,
+            }
+
+    def configure_game_actions(
+        self,
+        profile: dict[str, Any],
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist named, game-specific input actions."""
+
+        normalised = _normalise_action_profile(profile)
+        with self._lock:
+            session = self._require_locked(session_id)
+            game = session.setdefault("game", {})
+            game["action_profile"] = normalised
+            event = self._append_event_locked(
+                session,
+                "game_actions_configured",
+                {"action_profile": copy.deepcopy(normalised)},
+            )
+            self._save_locked(session)
+            return {
+                "session_id": session["session_id"],
+                "action_profile": copy.deepcopy(normalised),
+                "event": event,
+            }
+
+    def configure_game_timing(
+        self,
+        profile: dict[str, Any],
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist per-game post-input settling and typewriter timing."""
+
+        normalised = _normalise_timing_profile(profile)
+        with self._lock:
+            session = self._require_locked(session_id)
+            game = session.setdefault("game", {})
+            game["timing_profile"] = normalised
+            event = self._append_event_locked(
+                session,
+                "game_timing_configured",
+                {"timing_profile": copy.deepcopy(normalised)},
+            )
+            self._save_locked(session)
+            return {
+                "session_id": session["session_id"],
+                "timing_profile": copy.deepcopy(normalised),
+                "event": event,
+            }
 
     def close_session(self, session_id: str | None = None) -> dict[str, Any]:
         with self._lock:
@@ -292,6 +918,446 @@ class SessionStore:
                 ],
             }
 
+    # ---------- Codex-driven compaction ----------
+
+    @staticmethod
+    def _event_digest(events: Sequence[dict[str, Any]]) -> str:
+        encoded = json.dumps(
+            list(events),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _compaction_meta_locked(self, session: dict[str, Any]) -> dict[str, Any]:
+        """Return/migrate the small non-raw compaction manifest in a session."""
+
+        meta = session.get("compaction")
+        if not isinstance(meta, dict):
+            meta = {}
+            session["compaction"] = meta
+        meta.setdefault("schema_version", "1.0")
+        meta.setdefault("threshold_bytes", self.compaction_threshold_bytes)
+        meta.setdefault("keep_recent_events", self.compaction_keep_recent_events)
+        meta.setdefault("compacted_through_seq", 0)
+        meta.setdefault("segments", [])
+        meta.setdefault("pending", None)
+        try:
+            next_seq = int(meta.get("next_seq", 0))
+        except (TypeError, ValueError):
+            next_seq = 0
+        max_seq = max(
+            (int(event.get("seq", 0)) for event in session.get("timeline", []) if event.get("seq") is not None),
+            default=0,
+        )
+        meta["next_seq"] = max(next_seq, max_seq + 1, 1)
+        if not isinstance(meta.get("segments"), list):
+            meta["segments"] = []
+        return meta
+
+    @staticmethod
+    def _compaction_summary_defaults() -> dict[str, Any]:
+        return {
+            "key_facts": [],
+            "characters": [],
+            "choices": [],
+            "decisions": [],
+            "unresolved_threads": [],
+            "important_quotes": [],
+            "ocr_uncertainties": [],
+            "route_implications": [],
+            "loss_notes": [],
+            "variables": {},
+            "last_known_state": {},
+        }
+
+    @classmethod
+    def _normalise_compaction_summary(cls, summary: Any) -> dict[str, Any]:
+        if not isinstance(summary, dict):
+            raise SessionError("summary 必须是 JSON 对象")
+        try:
+            normalised = copy.deepcopy(summary)
+            encoded = json.dumps(normalised, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise SessionError("summary 必须只包含 JSON 可序列化值") from exc
+        if len(encoded.encode("utf-8")) > 2_000_000:
+            raise SessionError("summary 过大，不能超过 2 MB")
+        story_summary = _clean_text(
+            normalised.get("story_summary")
+            or normalised.get("summary_text")
+            or normalised.get("summary")
+        )
+        if not story_summary:
+            raise SessionError("summary 必须包含非空 story_summary")
+        normalised["story_summary"] = story_summary
+        normalised.pop("summary_text", None)
+        if isinstance(normalised.get("summary"), str):
+            normalised.pop("summary", None)
+        for key, default in cls._compaction_summary_defaults().items():
+            if key not in normalised:
+                normalised[key] = copy.deepcopy(default)
+            elif key == "variables" or key == "last_known_state":
+                if not isinstance(normalised[key], dict):
+                    raise SessionError(f"summary.{key} 必须是对象")
+            elif not isinstance(normalised[key], list):
+                raise SessionError(f"summary.{key} 必须是数组")
+            if isinstance(normalised.get(key), list) and len(normalised[key]) > 10_000:
+                raise SessionError(f"summary.{key} 不能超过 10000 项")
+        normalised["summary_version"] = str(normalised.get("summary_version") or "1.0")
+        return normalised
+
+    def _raw_json_size_locked(self, session: dict[str, Any]) -> tuple[int, int, int]:
+        """Return checkpoint bytes, journal bytes, and logical timeline bytes."""
+
+        try:
+            session_bytes = self.session_path(session["session_id"]).stat().st_size
+        except OSError:
+            session_bytes = len(json.dumps(session, ensure_ascii=False).encode("utf-8"))
+        try:
+            journal_bytes = self.event_journal_path(session["session_id"]).stat().st_size
+        except OSError:
+            journal_bytes = 0
+        timeline_bytes = len(
+            json.dumps(session.get("timeline", []), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        return session_bytes, journal_bytes, timeline_bytes
+
+    def _compaction_candidate_locked(
+        self,
+        session: dict[str, Any],
+        *,
+        keep_recent_events: int,
+        max_source_chars: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        timeline = session.get("timeline") or []
+        if len(timeline) <= keep_recent_events:
+            return [], "recent_event_tail_protected"
+        candidate_end = len(timeline) - keep_recent_events
+        unresolved_ids = {
+            str(choice.get("choice_id"))
+            for choice in session.get("choices", [])
+            if choice.get("selected_option_id") is None and choice.get("choice_id") is not None
+        }
+        # Never cut through an unresolved decision.  The current state keeps
+        # the choice too, but retaining its source event makes the first
+        # Codex summary auditable and prevents accidental loss of options.
+        for index, event in enumerate(timeline[:candidate_end]):
+            if event.get("type") in {"choice", "choice_resolved"} and str(event.get("choice_id")) in unresolved_ids:
+                candidate_end = index
+                break
+        if candidate_end <= 0:
+            return [], "unresolved_choice_in_compaction_prefix"
+
+        limit = max(16_384, min(int(max_source_chars), 2_000_000))
+        selected: list[dict[str, Any]] = []
+        current_chars = 2
+        for event in timeline[:candidate_end]:
+            event_chars = len(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+            if selected and current_chars + event_chars + 1 > limit:
+                break
+            selected.append(copy.deepcopy(event))
+            current_chars += event_chars + 1
+        if not selected:
+            return [], "source_event_exceeds_request_limit"
+        return selected, None
+
+    def _compaction_status_locked(
+        self,
+        session: dict[str, Any],
+        *,
+        threshold_bytes: int | None = None,
+        keep_recent_events: int | None = None,
+    ) -> dict[str, Any]:
+        meta = self._compaction_meta_locked(session)
+        threshold = self._bounded_compaction_threshold(
+            threshold_bytes if threshold_bytes is not None else meta.get("threshold_bytes", self.compaction_threshold_bytes)
+        )
+        keep = self._bounded_compaction_keep_recent_events(
+            keep_recent_events if keep_recent_events is not None else meta.get("keep_recent_events", self.compaction_keep_recent_events)
+        )
+        session_bytes, journal_bytes, timeline_bytes = self._raw_json_size_locked(session)
+        pending = meta.get("pending") if isinstance(meta.get("pending"), dict) else None
+        storage_bytes = session_bytes + journal_bytes
+        due = bool(pending or storage_bytes >= threshold)
+        candidate, reason = self._compaction_candidate_locked(
+            session,
+            keep_recent_events=keep,
+            max_source_chars=120_000,
+        )
+        if pending:
+            candidate_event_count = int(pending.get("event_count", 0))
+            candidate_start = pending.get("seq_start")
+            candidate_end = pending.get("seq_end")
+        else:
+            candidate_event_count = len(candidate)
+            candidate_start = candidate[0].get("seq") if candidate else None
+            candidate_end = candidate[-1].get("seq") if candidate else None
+        return {
+            "summary_due": due,
+            "threshold_bytes": threshold,
+            "session_json_bytes": session_bytes,
+            "event_journal_bytes": journal_bytes,
+            "storage_bytes": storage_bytes,
+            "raw_timeline_bytes": timeline_bytes,
+            "raw_event_count": len(session.get("timeline", [])),
+            "keep_recent_events": keep,
+            "compacted_through_seq": int(meta.get("compacted_through_seq") or 0),
+            "segment_count": len(meta.get("segments") or []),
+            "pending_request_id": pending.get("request_id") if pending else None,
+            "candidate_event_count": candidate_event_count,
+            "candidate_seq_start": candidate_start,
+            "candidate_seq_end": candidate_end,
+            "candidate_available": bool(candidate or pending),
+            "candidate_block_reason": reason if due and not candidate and not pending else None,
+        }
+
+    def compaction_status(
+        self,
+        threshold_bytes: int | None = None,
+        keep_recent_events: int | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            session = self._require_locked(session_id)
+            return {"session_id": session["session_id"], **self._compaction_status_locked(
+                session,
+                threshold_bytes=threshold_bytes,
+                keep_recent_events=keep_recent_events,
+            )}
+
+    def get_compaction_request(
+        self,
+        threshold_bytes: int | None = None,
+        keep_recent_events: int | None = None,
+        max_source_chars: int = 120_000,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Prepare a bounded source segment for Codex to summarize."""
+
+        with self._lock:
+            session = self._require_locked(session_id)
+            meta = self._compaction_meta_locked(session)
+            status = self._compaction_status_locked(
+                session,
+                threshold_bytes=threshold_bytes,
+                keep_recent_events=keep_recent_events,
+            )
+            pending = meta.get("pending") if isinstance(meta.get("pending"), dict) else None
+            if not status["summary_due"]:
+                return {"session_id": session["session_id"], **status, "request": None}
+
+            if pending:
+                events = [
+                    copy.deepcopy(event)
+                    for event in session.get("timeline", [])
+                    if int(pending.get("seq_start", 0)) <= int(event.get("seq", 0)) <= int(pending.get("seq_end", 0))
+                ]
+                if len(events) != int(pending.get("event_count", 0)) or self._event_digest(events) != pending.get("digest"):
+                    meta["pending"] = None
+                    pending = None
+                else:
+                    request = self._compaction_request_payload(session, pending, events)
+                    return {"session_id": session["session_id"], **status, "request": request}
+
+            if not status["candidate_available"]:
+                return {"session_id": session["session_id"], **status, "request": None}
+            limit = max(16_384, min(int(max_source_chars), 2_000_000))
+            keep = self._bounded_compaction_keep_recent_events(
+                keep_recent_events
+                if keep_recent_events is not None
+                else meta.get("keep_recent_events", self.compaction_keep_recent_events)
+            )
+            events, reason = self._compaction_candidate_locked(
+                session,
+                keep_recent_events=keep,
+                max_source_chars=limit,
+            )
+            if not events:
+                status["candidate_available"] = False
+                status["candidate_block_reason"] = reason or "no_compaction_candidate"
+                return {"session_id": session["session_id"], **status, "request": None}
+            pending = {
+                "request_id": new_id("compact"),
+                "seq_start": int(events[0]["seq"]),
+                "seq_end": int(events[-1]["seq"]),
+                "event_count": len(events),
+                "digest": self._event_digest(events),
+                "created_at": utc_now(),
+            }
+            meta["pending"] = pending
+            self._save_locked(session)
+            request = self._compaction_request_payload(session, pending, events)
+            return {
+                "session_id": session["session_id"],
+                **self._compaction_status_locked(session, threshold_bytes=threshold_bytes, keep_recent_events=keep_recent_events),
+                "request": request,
+            }
+
+    @staticmethod
+    def _compaction_request_payload(
+        session: dict[str, Any],
+        pending: dict[str, Any],
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "request_id": pending["request_id"],
+            "source": {
+                "session_id": session["session_id"],
+                "seq_start": pending["seq_start"],
+                "seq_end": pending["seq_end"],
+                "event_count": pending["event_count"],
+                "sha256": pending["digest"],
+            },
+            "events": events,
+            "summary_contract": {
+                "required": ["story_summary"],
+                "recommended": [
+                    "key_facts",
+                    "characters",
+                    "choices",
+                    "decisions",
+                    "unresolved_threads",
+                    "important_quotes",
+                    "ocr_uncertainties",
+                    "route_implications",
+                    "variables",
+                    "last_known_state",
+                    "loss_notes",
+                ],
+                "rules": [
+                    "保留事件顺序和人物关系，不要把不确定 OCR 当成确定事实",
+                    "完整记录每个选项、实际选择和选择后的结果；无法判断的内容写入 loss_notes 或 ocr_uncertainties",
+                    "保留未解决伏笔、路线变量、重要原文短句和当前状态",
+                    "只总结 source 中的内容，不凭空补写剧情",
+                ],
+            },
+        }
+
+    def save_compaction(
+        self,
+        request_id: str,
+        summary: dict[str, Any],
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate Codex's summary, persist it, then purge only its raw prefix."""
+
+        request_id = _clean_text(request_id)
+        if not request_id:
+            raise SessionError("request_id 不能为空")
+        normalised_summary = self._normalise_compaction_summary(summary)
+        with self._lock:
+            session = self._require_locked(session_id)
+            meta = self._compaction_meta_locked(session)
+            pending = meta.get("pending") if isinstance(meta.get("pending"), dict) else None
+            if not pending or pending.get("request_id") != request_id:
+                raise SessionError("compaction request 已过期或不存在，请重新调用 get_compaction_request")
+            source_count = int(pending.get("event_count", 0))
+            source_events = [copy.deepcopy(event) for event in session.get("timeline", [])[:source_count]]
+            if len(source_events) != source_count or self._event_digest(source_events) != pending.get("digest"):
+                raise SessionError("原始事件在总结期间发生变化，拒绝删除；请重新获取 compaction request")
+            if source_events and (
+                int(source_events[0].get("seq", 0)) != int(pending.get("seq_start", 0))
+                or int(source_events[-1].get("seq", 0)) != int(pending.get("seq_end", 0))
+            ):
+                raise SessionError("compaction source 范围不再是当前原始事件前缀，拒绝删除")
+
+            segment_number = len(meta.get("segments") or []) + 1
+            segment_id = f"segment_{segment_number:04d}_{int(pending['seq_end']):08d}"
+            relative_filename = Path("compactions") / f"{segment_id}.json"
+            session_directory = self.session_dir(session["session_id"])
+            destination = (session_directory / relative_filename).resolve()
+            try:
+                destination.relative_to(session_directory.resolve())
+            except ValueError as exc:
+                raise SessionError("compaction 文件路径无效") from exc
+            segment_payload = {
+                "record_type": "galgame_compaction",
+                "schema_version": "1.0",
+                "segment_id": segment_id,
+                "session_id": session["session_id"],
+                "created_at": utc_now(),
+                "source": {
+                    "seq_start": pending["seq_start"],
+                    "seq_end": pending["seq_end"],
+                    "event_count": source_count,
+                    "sha256": pending["digest"],
+                },
+                "summary": normalised_summary,
+            }
+            normalised_summary["source_seq_start"] = pending["seq_start"]
+            normalised_summary["source_seq_end"] = pending["seq_end"]
+            normalised_summary["source_event_count"] = source_count
+            encoded = json.dumps(segment_payload, ensure_ascii=False, indent=2) + "\n"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_suffix(destination.suffix + ".tmp")
+            temporary.write_text(encoded, encoding="utf-8")
+            # Re-read the just-written summary before changing session.json.
+            json.loads(temporary.read_text(encoding="utf-8"))
+            temporary.replace(destination)
+
+            segment_meta = {
+                "segment_id": segment_id,
+                "filename": str(relative_filename).replace("\\", "/"),
+                "seq_start": pending["seq_start"],
+                "seq_end": pending["seq_end"],
+                "event_count": source_count,
+                "sha256": pending["digest"],
+                "story_summary": normalised_summary["story_summary"],
+                "created_at": segment_payload["created_at"],
+            }
+            meta["segments"] = list(meta.get("segments") or []) + [segment_meta]
+            meta["compacted_through_seq"] = int(pending["seq_end"])
+            meta["pending"] = None
+            meta["next_seq"] = max(int(meta.get("next_seq", 1)), int(pending["seq_end"]) + 1)
+            session["timeline"] = session["timeline"][source_count:]
+            # The raw prefix is physically removed from the journal as well as
+            # from the in-memory timeline.  The summary segment was committed
+            # first, so an interruption before the checkpoint leaves recoverable
+            # old data rather than a partially purged session.
+            self._rewrite_journal_locked(session)
+            self._save_locked(session)
+            return {
+                "session_id": session["session_id"],
+                "segment": segment_meta,
+                "summary": copy.deepcopy(normalised_summary),
+                "raw_purged": True,
+                "purged_event_count": source_count,
+                "remaining_raw_event_count": len(session["timeline"]),
+                "path": str(destination),
+            }
+
+    def _load_compaction_summaries_locked(self, session: dict[str, Any]) -> list[dict[str, Any]]:
+        summaries: list[dict[str, Any]] = []
+        session_directory = self.session_dir(session["session_id"]).resolve()
+        for segment in self._compaction_meta_locked(session).get("segments") or []:
+            if not isinstance(segment, dict):
+                continue
+            filename = segment.get("filename")
+            if not filename:
+                continue
+            path = (session_directory / str(filename)).resolve()
+            try:
+                path.relative_to(session_directory)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                summaries.append({
+                    "segment_id": segment.get("segment_id"),
+                    "status": "missing_or_invalid",
+                    "source": {
+                        "seq_start": segment.get("seq_start"),
+                        "seq_end": segment.get("seq_end"),
+                    },
+                })
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("summary"), dict):
+                summaries.append({
+                    "segment_id": payload.get("segment_id"),
+                    "source": copy.deepcopy(payload.get("source") or {}),
+                    "summary": copy.deepcopy(payload["summary"]),
+                })
+        return summaries
+
     # ---------- event recording ----------
 
     def _append_event_locked(
@@ -300,9 +1366,12 @@ class SessionStore:
         event_type: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        meta = self._compaction_meta_locked(session)
+        seq = int(meta.get("next_seq", len(session["timeline"]) + 1))
+        meta["next_seq"] = seq + 1
         event = {
             "event_id": new_id("evt"),
-            "seq": len(session["timeline"]) + 1,
+            "seq": seq,
             "type": event_type,
             "created_at": utc_now(),
         }
@@ -497,9 +1566,10 @@ class SessionStore:
         choices: Sequence[str] | None = None,
         selected_index: int | None = None,
         screenshot_path: str | None = None,
-        source: str = "codex",
-        confidence: float | None = None,
-        note: str | None = None,
+    source: str = "codex",
+    confidence: float | None = None,
+    noise_flags: Sequence[dict[str, Any]] | None = None,
+    note: str | None = None,
         session_id: str | None = None,
     ) -> dict[str, Any]:
         if not any(
@@ -507,19 +1577,23 @@ class SessionStore:
             for value in (raw_text, text, speaker, scene_id, location, choices, screenshot_path, note)
         ):
             raise SessionError("observation 至少需要文本、场景、选项、截图或备注之一")
+        normalised_noise_flags = _normalise_noise_flags(noise_flags)
         with self._lock:
             session = self._require_locked(session_id)
             observation_id = new_id("obs")
             event_ids: list[str] = []
+            observation_payload: dict[str, Any] = {
+                "observation_id": observation_id,
+                "source": source or "codex",
+                "screenshot_path": screenshot_path,
+                "raw_text": raw_text,
+            }
+            if normalised_noise_flags:
+                observation_payload["noise_flags"] = copy.deepcopy(normalised_noise_flags)
             observation_event = self._append_event_locked(
                 session,
                 "observation",
-                {
-                    "observation_id": observation_id,
-                    "source": source or "codex",
-                    "screenshot_path": screenshot_path,
-                    "raw_text": raw_text,
-                },
+                observation_payload,
             )
             event_ids.append(observation_event["event_id"])
             state = session["current_state"]
@@ -544,6 +1618,8 @@ class SessionStore:
                     "text": text.strip(),
                     "source": source or "codex",
                 }
+                if normalised_noise_flags:
+                    payload["noise_flags"] = copy.deepcopy(normalised_noise_flags)
                 if confidence is not None:
                     payload["confidence"] = max(0.0, min(float(confidence), 1.0))
                 event = self._append_event_locked(session, "dialogue", payload)
@@ -732,6 +1808,11 @@ class SessionStore:
                 "unresolved_choices": unresolved,
                 "recent_dialogue": recent_dialogue,
                 "notes": notes,
+                # Historical raw events may have been purged after Codex
+                # returned a validated summary.  These files are the durable
+                # long-term memory that must be combined with the raw tail.
+                "compacted_summaries": self._load_compaction_summaries_locked(session),
+                "compaction": self._compaction_status_locked(session),
             }
             if include_markdown:
                 context["codex_markdown"] = self._render_markdown(session, limit)
@@ -776,7 +1857,7 @@ class SessionStore:
     def _compact_event(event: dict[str, Any]) -> dict[str, Any]:
         event_type = event.get("type")
         keys_by_type = {
-            "dialogue": ("seq", "type", "scene_id", "speaker", "text", "source", "confidence"),
+            "dialogue": ("seq", "type", "scene_id", "speaker", "text", "source", "confidence", "noise_flags"),
             "choice": ("seq", "type", "choice_id", "scene_id", "prompt", "options", "selected_option_id", "selected_label", "source"),
             "choice_resolved": ("seq", "type", "choice_id", "selected_index", "selected_label", "source"),
             "scene": ("seq", "type", "scene_id", "location", "background"),
@@ -848,6 +1929,7 @@ class SessionStore:
     @staticmethod
     def _summary(session: dict[str, Any]) -> dict[str, Any]:
         state = session.get("current_state", {})
+        compaction = session.get("compaction") or {}
         return {
             "session_id": session["session_id"],
             "status": session.get("status", "active"),
@@ -860,6 +1942,10 @@ class SessionStore:
             "unresolved_choice_count": sum(
                 1 for choice in session.get("choices", []) if choice.get("selected_option_id") is None
             ),
+            "compaction": {
+                "compacted_through_seq": int(compaction.get("compacted_through_seq") or 0),
+                "segment_count": len(compaction.get("segments") or []) if isinstance(compaction.get("segments"), list) else 0,
+            },
         }
 
     @staticmethod

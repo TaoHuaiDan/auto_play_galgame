@@ -15,6 +15,50 @@ class SessionStoreTests(unittest.TestCase):
             store = SessionStore(root)
             summary = store.create_session("测试视觉小说", session_id="test-session")
             self.assertEqual(summary["session_id"], "test-session")
+            configured = store.configure_game_layout(
+                {
+                    "dialogue_region": {
+                        "x": 0.1,
+                        "y": 0.7,
+                        "width": 0.8,
+                        "height": 0.25,
+                        "coordinate_space": "normalized",
+                    },
+                    "speaker_region": {"x": 0, "y": 0, "width": 1, "height": 0.4},
+                    "speaker_markers": [{"open": "<", "close": ">", "allow_unclosed": True}],
+                    "dialogue_markers": [{"open": "{", "close": "}"}],
+                }
+            )
+            self.assertEqual(configured["layout_profile"]["speaker_markers"][0]["open"], "<")
+            self.assertEqual(store.get_session()["game"]["layout_profile"]["dialogue_region"]["width"], 0.8)
+
+            configured_actions = store.configure_game_actions(
+                {
+                    "hide_ui": {
+                        "kind": "click",
+                        "target": "window_center",
+                        "button": "right",
+                        "delivery": "send",
+                    },
+                    "skip_line": {"kind": "key", "key": "RIGHT"},
+                }
+            )
+            self.assertEqual(configured_actions["action_profile"]["hide_ui"]["button"], "right")
+            self.assertEqual(store.get_session()["game"]["action_profile"]["skip_line"]["key"], "RIGHT")
+
+            configured_timing = store.configure_game_timing(
+                {
+                    "strategy": "adaptive",
+                    "post_click_wait_seconds": -1,
+                    "settle_timeout_seconds": 5.5,
+                    "settle_poll_seconds": 0.15,
+                    "stable_samples": 4,
+                    "require_text_change": True,
+                }
+            )
+            self.assertEqual(configured_timing["timing_profile"]["strategy"], "text_hash")
+            self.assertEqual(configured_timing["timing_profile"]["post_click_wait_seconds"], 0.0)
+            self.assertEqual(store.get_session()["game"]["timing_profile"]["stable_samples"], 4)
 
             observation = store.record_observation(
                 raw_text="【小葵】\n今天放学后要一起回家吗？\n1. 答应\n2. 婉拒",
@@ -66,6 +110,92 @@ class SessionStoreTests(unittest.TestCase):
             resumed = reloaded.get_current_state("test-session")
             self.assertEqual(resumed["current_state"]["variables"]["aoi_affection"], 2)
             self.assertEqual(resumed["timeline_count"], store.get_current_state()["timeline_count"])
+            self.assertEqual(
+                reloaded.get_session("test-session")["game"]["timing_profile"]["strategy"],
+                "text_hash",
+            )
+
+    def test_codex_compaction_purges_only_validated_raw_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SessionStore(
+                Path(temporary),
+                compaction_threshold_bytes=16_384,
+                compaction_keep_recent_events=4,
+            )
+            store.create_session("压缩测试", session_id="compact-session")
+            for index in range(10):
+                store.record_dialogue(f"第 {index} 句 " + ("重要剧情信息。" * 260), speaker="角色A")
+
+            status = store.compaction_status(session_id="compact-session")
+            self.assertTrue(status["summary_due"])
+            request = store.get_compaction_request(
+                max_source_chars=40_000,
+                session_id="compact-session",
+            )
+            self.assertTrue(request["request"])
+            source = request["request"]["source"]
+            self.assertGreater(source["event_count"], 0)
+
+            saved = store.save_compaction(
+                request_id=request["request"]["request_id"],
+                summary={
+                    "story_summary": "前段确认角色A在放学后提出了关键请求，路线仍需结合后续对白判断。",
+                    "key_facts": ["角色A提出关键请求"],
+                    "decisions": [],
+                    "unresolved_threads": ["后续需要确认请求的结果"],
+                    "ocr_uncertainties": [],
+                    "loss_notes": [],
+                },
+                session_id="compact-session",
+            )
+            self.assertTrue(saved["raw_purged"])
+            self.assertEqual(saved["purged_event_count"], source["event_count"])
+            segment_path = Path(saved["path"])
+            self.assertTrue(segment_path.exists())
+            segment_text = segment_path.read_text(encoding="utf-8")
+            self.assertNotIn("重要剧情信息。重要剧情信息。重要剧情信息。", segment_text)
+
+            state = store.get_current_state("compact-session")
+            self.assertEqual(state["timeline_count"], 10 - source["event_count"])
+            store.record_dialogue("压缩后的新对白", speaker="角色B", session_id="compact-session")
+            new_session = store.get_session("compact-session")
+            self.assertGreater(new_session["timeline"][-1]["seq"], source["seq_end"])
+
+            context = store.build_context(session_id="compact-session", include_markdown=False, compact=True)
+            self.assertEqual(len(context["compacted_summaries"]), 1)
+            self.assertIn("角色A", context["compacted_summaries"][0]["summary"]["story_summary"])
+
+            reloaded = SessionStore(Path(temporary), compaction_threshold_bytes=16_384, compaction_keep_recent_events=4)
+            reloaded_context = reloaded.build_context(
+                session_id="compact-session",
+                include_markdown=False,
+                compact=True,
+            )
+            self.assertEqual(len(reloaded_context["compacted_summaries"]), 1)
+
+    def test_event_journal_keeps_checkpoint_small_and_reloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SessionStore(root)
+            store.create_session("日志测试", session_id="journal-session")
+            for index in range(20):
+                store.record_dialogue(
+                    f"第 {index} 句 " + ("长对白内容。" * 80),
+                    speaker="角色A",
+                    session_id="journal-session",
+                )
+
+            checkpoint = root / "journal-session" / "session.json"
+            journal = root / "journal-session" / "events.jsonl"
+            self.assertTrue(journal.exists())
+            self.assertLess(checkpoint.stat().st_size, journal.stat().st_size)
+            checkpoint_payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint_payload["timeline"], [])
+
+            reloaded = SessionStore(root)
+            state = reloaded.get_current_state("journal-session")
+            self.assertEqual(state["timeline_count"], 20)
+            self.assertEqual(state["current_state"]["speaker"], "角色A")
 
 
 if __name__ == "__main__":
