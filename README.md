@@ -55,15 +55,15 @@ codex mcp list
 
 ```toml
 [mcp_servers.galgame]
-command = "C:\\Users\\ASUS\\AppData\\Local\\Programs\\Python\\Python312\\python.exe"
+command = "C:\\Path\\To\\Python\\python.exe"
 args = ["-m", "galgame_mcp.server"]
-cwd = "D:\\codex_project\\auto_play_galgame"
+cwd = "D:\\path\\to\\auto_play_galgame"
 startup_timeout_sec = 20
 tool_timeout_sec = 120
 default_tools_approval_mode = "prompt"
 
 [mcp_servers.galgame.env]
-GALGAME_MCP_DATA_DIR = "D:\\codex_project\\auto_play_galgame\\.galgame_sessions"
+GALGAME_MCP_DATA_DIR = "D:\\path\\to\\auto_play_galgame\\.galgame_sessions"
 ```
 
 Python 路径按实际安装位置替换。也可以不设置 `GALGAME_MCP_DATA_DIR`，默认写入项目下的 `.galgame_sessions`。

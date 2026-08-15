@@ -1,8 +1,8 @@
 # 复制需要的部分到 ~/.codex/config.toml，或项目受信任时放到 .codex/config.toml。
 [mcp_servers.galgame]
-command = "C:\\Users\\ASUS\\AppData\\Local\\Programs\\Python\\Python312\\python.exe"
+command = "C:\\Path\\To\\Python\\python.exe"
 args = ["-m", "galgame_mcp.server"]
-cwd = "D:\\codex_project\\auto_play_galgame"
+cwd = "D:\\path\\to\\auto_play_galgame"
 startup_timeout_sec = 20
 tool_timeout_sec = 120
 default_tools_approval_mode = "prompt"
@@ -15,4 +15,4 @@ default_tools_approval_mode = "prompt"
 # configure fixed regions/actions/timing from the actual game frame.
 
 [mcp_servers.galgame.env]
-GALGAME_MCP_DATA_DIR = "D:\\codex_project\\auto_play_galgame\\.galgame_sessions"
+GALGAME_MCP_DATA_DIR = "D:\\path\\to\\auto_play_galgame\\.galgame_sessions"
