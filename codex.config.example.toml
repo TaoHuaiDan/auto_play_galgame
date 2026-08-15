@@ -1,31 +1,18 @@
 # 复制需要的部分到 ~/.codex/config.toml，或项目受信任时放到 .codex/config.toml。
 [mcp_servers.galgame]
-command = "C:\\Users\\ASUS\\AppData\\Local\\Programs\\Python\\Python312\\python.exe"
+command = "C:\\Path\\To\\Python\\python.exe"
 args = ["-m", "galgame_mcp.server"]
-cwd = "D:\\codex_project\\auto_play_galgame"
+cwd = "D:\\path\\to\\auto_play_galgame"
 startup_timeout_sec = 20
-tool_timeout_sec = 60
+tool_timeout_sec = 120
 default_tools_approval_mode = "prompt"
-# Token-saving autoplay profile: local OCR and parsing happen inside observe_game.
-# Low-level raw capture/OCR/recording tools are intentionally omitted.
-enabled_tools = [
-    "start_session",
-    "list_sessions",
-    "set_active_session",
-    "get_current_state",
-    "attach_game",
-    "observe_game",
-    "advance_game",
-    "select_choice",
-    "focus_game_window",
-    "press_key",
-    "click_screen",
-    "wait",
-    "search_story",
-    "get_codex_context",
-    "export_session",
-    "close_session",
-]
+# Do not set enabled_tools here.  The MCP server exposes its complete tool
+# surface; per-game differences belong in configure_game_layout,
+# configure_game_actions, and configure_game_timing instead of a static
+# Codex-side allowlist.
+# After connecting, start or resume a session, attach the already-open game
+# window, run one full observe_game(capture_mode="window"), and only then
+# configure fixed regions/actions/timing from the actual game frame.
 
 [mcp_servers.galgame.env]
-GALGAME_MCP_DATA_DIR = "D:\\codex_project\\auto_play_galgame\\.galgame_sessions"
+GALGAME_MCP_DATA_DIR = "D:\\path\\to\\auto_play_galgame\\.galgame_sessions"

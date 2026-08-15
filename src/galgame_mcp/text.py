@@ -9,13 +9,119 @@ _CHOICE_PATTERNS = [
     re.compile(r"^\s*(?:\d{1,2}\s*[.)、:：]|[（(]\s*\d{1,2}\s*[)）])\s*(?P<label>.+?)\s*$"),
     re.compile(r"^\s*[-*•]\s+(?P<label>.+?)\s*$"),
 ]
-_BRACKET_SPEAKER = re.compile(
-    r"^\s*[【\[](?P<speaker>[^】\]]{1,30})[】\]]\s*(?::|：)?\s*(?P<text>.*)$"
-)
 _COLON_SPEAKER = re.compile(
     r"^\s*(?P<speaker>[^:：\n]{1,20})\s*[:：]\s+(?P<text>.+?)\s*$"
 )
 _NOISE = re.compile(r"^\s*(?:[-_=~·•]{3,}|>>+|skip|auto|save|load)\s*$", re.I)
+_DIALOGUE_CHAR = r"\u2e80-\u9fff\u3040-\u30ff\ua960-\ua97f，。！？、；：,.!?"
+_BETWEEN_DIALOGUE_CHAR_SPACE = re.compile(rf"(?<=[{_DIALOGUE_CHAR}])[ \t]+(?=[{_DIALOGUE_CHAR}])")
+_OCR_SYMBOL = re.compile(rf"[{_DIALOGUE_CHAR}A-Za-z0-9]", re.UNICODE)
+
+
+def _marker_specs(profile: dict[str, Any] | None, key: str) -> list[dict[str, Any]]:
+    """Return validated-looking marker records without imposing a symbol set.
+
+    Marker characters are deliberately supplied by the active game's layout
+    profile. The parser accepts the documented object form and a compact
+    two-item list form so profiles remain easy to author by hand.
+    """
+
+    if not isinstance(profile, dict):
+        return []
+    raw_markers = profile.get(key) or []
+    if isinstance(raw_markers, dict):
+        raw_markers = [raw_markers]
+    if not isinstance(raw_markers, (list, tuple)):
+        return []
+    markers: list[dict[str, Any]] = []
+    for item in raw_markers:
+        if isinstance(item, dict):
+            opener = str(item.get("open") or item.get("opener") or "").strip()
+            closer = str(item.get("close") or item.get("closer") or "").strip()
+            allow_unclosed = bool(item.get("allow_unclosed", False))
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            opener = str(item[0] or "").strip()
+            closer = str(item[1] or "").strip()
+            allow_unclosed = bool(item[2]) if len(item) >= 3 else False
+        else:
+            continue
+        if not opener:
+            continue
+        markers.append(
+            {
+                "open": opener,
+                "close": closer,
+                "allow_unclosed": allow_unclosed,
+            }
+        )
+    return markers
+
+
+def _marker_tokens(profile: dict[str, Any] | None) -> tuple[list[str], list[str]]:
+    openers: list[str] = []
+    closers: list[str] = []
+    for key in ("speaker_markers", "dialogue_markers"):
+        for marker in _marker_specs(profile, key):
+            if marker["open"] not in openers:
+                openers.append(marker["open"])
+            if marker["close"] and marker["close"] not in closers:
+                closers.append(marker["close"])
+    return openers, closers
+
+
+def _clean_speaker_name(value: str) -> str:
+    """Remove OCR-inserted inter-character spaces from a name label."""
+
+    cleaned = re.sub(r"\s+", "", value or "").strip()
+    # OCR frequently leaves punctuation where a configured opener/closer was
+    # dropped. Strip non-word edges generically instead of naming one game's
+    # glyphs here.
+    cleaned = re.sub(r"^\W+", "", cleaned, flags=re.UNICODE)
+    cleaned = re.sub(r"\W+$", "", cleaned, flags=re.UNICODE)
+    return cleaned.strip()
+
+
+def _clean_dialogue_spacing(
+    value: str,
+    layout_profile: dict[str, Any] | None = None,
+) -> str:
+    """Remove Windows OCR's inter-character spaces from CJK dialogue."""
+
+    value = _BETWEEN_DIALOGUE_CHAR_SPACE.sub("", value or "")
+    openers, closers = _marker_tokens(layout_profile)
+    if openers:
+        opener_pattern = "|".join(re.escape(token) for token in sorted(openers, key=len, reverse=True))
+        value = re.sub(rf"({opener_pattern})[ \t]+", r"\1", value)
+    if closers:
+        closer_pattern = "|".join(re.escape(token) for token in sorted(closers, key=len, reverse=True))
+        value = re.sub(rf"[ \t]+({closer_pattern})", r"\1", value)
+    return value.strip()
+
+_SETTINGS_TITLE_MARKERS = (
+    "系统设置",
+    "系统菜单",
+    "設定画面",
+    "システム設定",
+    "システムメニュー",
+    "systemconfig",
+    "systemsettings",
+    "systemmenu",
+    "gamemenu",
+)
+_SETTINGS_OPTION_MARKERS = (
+    "显示模式",
+    "画面比例",
+    "画面效果",
+    "动画效果",
+    "esc键功能",
+    "功能区域开关",
+    "章节标题显示时间",
+    "背景音乐曲名显示时间",
+    "画面設定",
+    "ゲーム設定",
+    "テキスト設定",
+    "escキー機能",
+)
 
 
 def _normalise_lines(raw_text: str) -> list[str]:
@@ -29,12 +135,354 @@ def _normalise_lines(raw_text: str) -> list[str]:
     return result
 
 
-def parse_screen_text(raw_text: str) -> dict[str, Any]:
+def _ocr_noise_flags(
+    raw_text: str,
+    layout_profile: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Annotate likely OCR artifacts without changing the source text.
+
+    These are deliberately hints rather than rejection rules.  The raw OCR
+    remains in the observation, while Codex can decide whether a flagged line
+    matters for a route decision.
+    """
+
+    flags: list[dict[str, Any]] = []
+    source_lines = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    marker_groups = (
+        _marker_specs(layout_profile, "speaker_markers"),
+        _marker_specs(layout_profile, "dialogue_markers"),
+    )
+    for line_number, source_line in enumerate(source_lines, start=1):
+        line = source_line.strip()
+        if not line:
+            continue
+        code: str | None = None
+        severity = "low"
+        reason = ""
+        if _NOISE.fullmatch(line):
+            code = "separator_or_ui"
+            reason = "separator or common UI token was removed by conservative line normalization"
+        elif "\ufffd" in line or "\x00" in line:
+            code = "replacement_character"
+            severity = "high"
+            reason = "OCR contains a replacement or NUL character"
+        elif _BETWEEN_DIALOGUE_CHAR_SPACE.search(line):
+            code = "spacing_artifact"
+            reason = "spaces occur between adjacent dialogue characters"
+        else:
+            for markers in marker_groups:
+                for marker in markers:
+                    opener = str(marker.get("open") or "")
+                    closer = str(marker.get("close") or "")
+                    if opener and line.startswith(opener) and closer and closer not in line:
+                        code = "unclosed_marker"
+                        severity = "medium"
+                        reason = "configured marker opener was detected without its closing marker"
+                        break
+                if code:
+                    break
+        if code is None and len(line) >= 4:
+            meaningful = len(_OCR_SYMBOL.findall(line))
+            symbol_count = len(re.findall(r"[^\w\s\u2e80-\u9fff\u3040-\u30ff\ua960-\ua97f]", line, re.UNICODE))
+            if symbol_count >= 3 and symbol_count > meaningful:
+                code = "symbol_heavy"
+                severity = "medium"
+                reason = "line contains an unusually high proportion of punctuation or OCR symbols"
+        if code:
+            flags.append(
+                {
+                    "code": code,
+                    "severity": severity,
+                    "line": line_number,
+                    "text": line[:160],
+                    "reason": reason,
+                }
+            )
+        if len(flags) >= 32:
+            break
+    return flags
+
+
+def detect_screen_type(raw_text: str) -> str | None:
+    """Detect a settings/configuration page without treating its controls as story choices."""
+
+    compact = re.sub(r"\s+", "", (raw_text or "")).casefold()
+    if not compact:
+        return None
+    if any(marker.casefold() in compact for marker in _SETTINGS_TITLE_MARKERS):
+        return "settings"
+    option_hits = sum(marker.casefold() in compact for marker in _SETTINGS_OPTION_MARKERS)
+    return "settings" if option_hits >= 2 else None
+
+
+def _compact_ocr_text(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or ""))
+
+
+def _region_for_line(
+    line: str,
+    regions: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Find the OCR region corresponding to a normalized text line."""
+
+    compact_line = _compact_ocr_text(line)
+    if not compact_line:
+        return None
+    for region in regions or []:
+        if _compact_ocr_text(region.get("text")) == compact_line:
+            return region
+    return None
+
+
+def _profile_region_bounds(
+    profile: dict[str, Any] | None,
+    key: str,
+    image_size: tuple[int, int] | None,
+) -> tuple[float, float, float, float] | None:
+    """Resolve a profile region against the image supplied to the parser.
+
+    The server projects session profiles into pixel coordinates before parsing
+    captures. Direct ``parse_text`` callers may still provide normalized or
+    pixel regions, so this helper supports both forms as a fallback.
+    """
+
+    if not isinstance(profile, dict) or not image_size:
+        return None
+    region = profile.get(key)
+    if not isinstance(region, dict):
+        return None
+    try:
+        width, height = image_size
+        x = float(region["x"])
+        y = float(region["y"])
+        region_width = float(region["width"])
+        region_height = float(region["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    coordinate_space = str(region.get("coordinate_space") or "").strip().casefold()
+    if coordinate_space in {"normalized", "normalised", "relative", "fraction", "dialogue_region", "dialogue_box"}:
+        x *= width
+        y *= height
+        region_width *= width
+        region_height *= height
+    elif coordinate_space not in {"pixels", "pixel", "absolute", "image"}:
+        return None
+    return x, y, region_width, region_height
+
+
+def _region_center(region: dict[str, Any]) -> tuple[float, float] | None:
+    try:
+        x = float(region.get("x", 0))
+        y = float(region.get("y", 0))
+        width = max(0.0, float(region.get("width", 0)))
+        height = max(0.0, float(region.get("height", 0)))
+    except (TypeError, ValueError):
+        return None
+    return x + width / 2.0, y + height / 2.0
+
+
+def _point_in_bounds(point: tuple[float, float], bounds: tuple[float, float, float, float]) -> bool:
+    x, y = point
+    left, top, width, height = bounds
+    return left <= x <= left + width and top <= y <= top + height
+
+
+def _match_marker_line(
+    line: str,
+    markers: list[dict[str, Any]],
+) -> tuple[str, str] | None:
+    """Extract a marker-delimited label using only the supplied profile."""
+
+    stripped = line.strip()
+    for marker in markers:
+        opener = marker["open"]
+        if not stripped.startswith(opener):
+            continue
+        body = stripped[len(opener) :].strip()
+        closer = marker.get("close") or ""
+        close_index = body.find(closer) if closer else -1
+        if close_index < 0:
+            if not marker.get("allow_unclosed"):
+                continue
+            name_text, remainder = body, ""
+        else:
+            name_text = body[:close_index]
+            remainder = body[close_index + len(closer) :].strip()
+        speaker = _clean_speaker_name(name_text)
+        if not speaker:
+            continue
+        return speaker, remainder
+    return None
+
+
+def _starts_with_marker(line: str, markers: list[dict[str, Any]]) -> bool:
+    stripped = line.strip()
+    return any(stripped.startswith(marker["open"]) for marker in markers)
+
+
+def _choice_line_allowed(
+    line: str,
+    regions: list[dict[str, Any]] | None,
+    image_size: tuple[int, int] | None,
+    layout_profile: dict[str, Any] | None,
+) -> bool:
+    """Apply the configured choice zone to prefixed and unprefixed choices."""
+
+    if not isinstance(layout_profile, dict):
+        return True
+    choice_bounds = _profile_region_bounds(layout_profile, "choice_region", image_size)
+    if choice_bounds is None:
+        return True
+    region = _region_for_line(line, regions)
+    if region is None:
+        # Raw-text callers may not have coordinates; preserve explicit numeric
+        # choice parsing instead of silently discarding their input.
+        return True
+    center = _region_center(region)
+    return center is not None and _point_in_bounds(center, choice_bounds)
+
+
+def _layout_name_label(
+    line: str,
+    line_index: int,
+    regions: list[dict[str, Any]] | None,
+    image_size: tuple[int, int] | None,
+    layout_profile: dict[str, Any] | None,
+) -> tuple[str, str] | None:
+    """Parse a fixed-layout name box using the active game's marker profile."""
+
+    markers = _marker_specs(layout_profile, "speaker_markers")
+    if not markers:
+        return None
+    matched = _match_marker_line(line, markers)
+    if matched is None:
+        return None
+    speaker_region = _region_for_line(line, regions)
+    speaker_bounds = _profile_region_bounds(layout_profile, "speaker_region", image_size)
+    if speaker_bounds is not None and speaker_region is not None:
+        center = _region_center(speaker_region)
+        if center is None or not _point_in_bounds(center, speaker_bounds):
+            return None
+    elif speaker_bounds is not None and not regions and line_index != 0:
+        return None
+    speaker, remainder = matched
+    try:
+        max_chars = max(1, min(int((layout_profile or {}).get("speaker_max_chars", 40)), 200))
+    except (TypeError, ValueError):
+        max_chars = 40
+    if len(speaker) > max_chars:
+        return None
+    return speaker, remainder
+
+
+def _layout_choice_keys(
+    regions: list[dict[str, Any]] | None,
+    image_size: tuple[int, int] | None,
+    layout_profile: dict[str, Any] | None,
+) -> set[str]:
+    """Find short option rows inside the configured choice region."""
+
+    if not regions or not image_size or not isinstance(layout_profile, dict):
+        return set()
+    image_width, image_height = image_size
+    if image_width <= 0 or image_height <= 0:
+        return set()
+    if (
+        layout_profile.get("_capture_scope") == "window_dialogue_region"
+        and not bool(layout_profile.get("choice_detection_on_crops", False))
+    ):
+        return set()
+    choice_bounds = _profile_region_bounds(layout_profile, "choice_region", image_size)
+    if choice_bounds is None:
+        return set()
+    try:
+        minimum_count = max(2, min(int(layout_profile.get("choice_min_count", 2)), 10))
+    except (TypeError, ValueError):
+        minimum_count = 2
+    choice_layout = str(layout_profile.get("choice_layout") or "vertical").strip().casefold()
+    if choice_layout not in {"vertical", "horizontal", "both"}:
+        choice_layout = "vertical"
+    excluded_text = [
+        _compact_ocr_text(item).casefold()
+        for item in (layout_profile.get("choice_exclude_text") or [])
+        if _compact_ocr_text(item)
+    ]
+    candidates: list[dict[str, Any]] = []
+    for region in regions:
+        text = _clean_dialogue_spacing(str(region.get("text") or ""), layout_profile)
+        compact = _compact_ocr_text(text)
+        if not compact or len(compact) > 40:
+            continue
+        lowered = compact.casefold()
+        if any(marker in lowered for marker in excluded_text):
+            continue
+        try:
+            x = float(region.get("x", 0))
+            y = float(region.get("y", 0))
+            width = max(0.0, float(region.get("width", 0)))
+            height = max(0.0, float(region.get("height", 0)))
+        except (TypeError, ValueError):
+            continue
+        center_x = x + width / 2
+        center_y = y + height / 2
+        if not _point_in_bounds((center_x, center_y), choice_bounds):
+            continue
+        try:
+            minimum_height_ratio = max(0.0, min(float(layout_profile.get("choice_min_height_ratio", 0.015)), 1.0))
+        except (TypeError, ValueError):
+            minimum_height_ratio = 0.015
+        if height < max(12.0, image_height * minimum_height_ratio):
+            continue
+        candidates.append(
+            {
+                "key": compact,
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+                "center_x": center_x,
+                "center_y": center_y,
+            }
+        )
+    if len(candidates) < minimum_count:
+        return set()
+
+    selected: list[dict[str, Any]] = []
+    for index, first in enumerate(candidates):
+        for second in candidates[index + 1 :]:
+            vertical_pair = (
+                abs(first["center_x"] - second["center_x"]) <= image_width * 0.18
+                and abs(first["center_y"] - second["center_y"]) >= image_height * 0.045
+                and abs(first["center_y"] - second["center_y"]) <= image_height * 0.28
+            )
+            horizontal_pair = (
+                abs(first["center_y"] - second["center_y"]) <= image_height * 0.08
+                and abs(first["center_x"] - second["center_x"]) >= image_width * 0.06
+            )
+            if (choice_layout in {"vertical", "both"} and vertical_pair) or (
+                choice_layout in {"horizontal", "both"} and horizontal_pair
+            ):
+                selected.extend((first, second))
+    if len({str(item["key"]) for item in selected}) < minimum_count:
+        return set()
+    return {str(item["key"]) for item in selected}
+
+
+def parse_screen_text(
+    raw_text: str,
+    *,
+    regions: list[dict[str, Any]] | None = None,
+    image_size: tuple[int, int] | None = None,
+    layout_profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Heuristically split OCR/clipboard text into speaker, dialogue and choices.
 
-    The parser is deliberately conservative: it only labels a speaker when OCR
-    provides a clear bracket or ``name: text`` marker. Ambiguous lines remain in
-    ``unparsed_lines`` so Codex can resolve them with visual context.
+    Marker-delimited speaker/dialogue lines and unnumbered visual choices are
+    interpreted only when the active game's ``layout_profile`` supplies those
+    markers/regions. Without a profile the parser remains conservative and
+    still handles numeric choices and ``name: dialogue`` text.
     """
 
     lines = _normalise_lines(raw_text)
@@ -43,6 +491,11 @@ def parse_screen_text(raw_text: str) -> dict[str, Any]:
     unparsed_lines: list[str] = []
     speaker: str | None = None
     explicit_speaker = False
+    profile = layout_profile if isinstance(layout_profile, dict) else {}
+    noise_flags = _ocr_noise_flags(raw_text, profile)
+    layout_choice_keys = _layout_choice_keys(regions, image_size, profile)
+    speaker_markers = _marker_specs(profile, "speaker_markers")
+    dialogue_markers = _marker_specs(profile, "dialogue_markers")
 
     for line_number, line in enumerate(lines, start=1):
         choice_match = None
@@ -51,6 +504,9 @@ def parse_screen_text(raw_text: str) -> dict[str, Any]:
             if choice_match:
                 break
         if choice_match:
+            if not _choice_line_allowed(line, regions, image_size, profile):
+                unparsed_lines.append(line)
+                continue
             choice_records.append(
                 {
                     "option_id": str(len(choice_records) + 1),
@@ -60,15 +516,36 @@ def parse_screen_text(raw_text: str) -> dict[str, Any]:
                 }
             )
             continue
+        if _compact_ocr_text(line) in layout_choice_keys:
+            choice_records.append(
+                {
+                    "option_id": str(len(choice_records) + 1),
+                    "label": _clean_dialogue_spacing(line, profile),
+                    "line": line_number,
+                    "raw": line,
+                }
+            )
+            continue
 
         if speaker is None:
-            bracket_match = _BRACKET_SPEAKER.match(line)
-            if bracket_match and bracket_match.group("speaker").strip():
-                speaker = bracket_match.group("speaker").strip()
+            layout_name = _layout_name_label(
+                line,
+                line_number - 1,
+                regions,
+                image_size,
+                profile,
+            )
+            if layout_name is not None:
+                speaker, remainder = layout_name
                 explicit_speaker = True
-                remainder = bracket_match.group("text").strip()
                 if remainder:
                     dialogue_lines.append(remainder)
+                continue
+            # A configured dialogue opener has priority over an ambiguous
+            # speaker marker. If a game uses the same pair for both roles, it
+            # should list that pair only in the role it wants recognized.
+            if _starts_with_marker(line, dialogue_markers):
+                dialogue_lines.append(line)
                 continue
             colon_match = _COLON_SPEAKER.match(line)
             if colon_match:
@@ -79,12 +556,12 @@ def parse_screen_text(raw_text: str) -> dict[str, Any]:
                     dialogue_lines.append(colon_match.group("text").strip())
                     continue
 
-        if line.startswith(("【", "[")) and not explicit_speaker:
+        if _starts_with_marker(line, speaker_markers) and not explicit_speaker:
             unparsed_lines.append(line)
         else:
             dialogue_lines.append(line)
 
-    dialogue = "\n".join(dialogue_lines).strip()
+    dialogue = _clean_dialogue_spacing("\n".join(dialogue_lines), profile)
     choices = [record["label"] for record in choice_records]
     if explicit_speaker and choices:
         confidence = 0.93
@@ -98,6 +575,7 @@ def parse_screen_text(raw_text: str) -> dict[str, Any]:
         confidence = 0.58
     else:
         confidence = 0.0
+    screen_type = detect_screen_type(raw_text)
     return {
         "raw_text": raw_text,
         "clean_text": "\n".join(lines),
@@ -108,4 +586,6 @@ def parse_screen_text(raw_text: str) -> dict[str, Any]:
         "unparsed_lines": unparsed_lines,
         "line_count": len(lines),
         "confidence": confidence,
+        "screen_type": screen_type,
+        "noise_flags": noise_flags,
     }
