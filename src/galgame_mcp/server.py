@@ -284,7 +284,12 @@ def _usable_story_text(value: Any) -> bool:
 
 
 def _parsed_has_story_text(parsed: dict[str, Any] | None) -> bool:
-    """Check parsed OCR without treating a speaker-only/UI frame as dialogue."""
+    """Check parsed OCR using only spatially classified story channels.
+
+    ``unparsed_lines`` are intentionally excluded.  They are retained in the
+    local event for visual review, but treating them as story text would let a
+    chapter card or an unknown overlay bypass the focused-OCR and safety stop.
+    """
 
     if not isinstance(parsed, dict):
         return False
@@ -297,11 +302,7 @@ def _parsed_has_story_text(parsed: dict[str, Any] | None) -> bool:
     # residue, so a non-empty recognized line is still useful story state.
     if parsed.get("text_status") == "recognized" and str(parsed.get("dialogue") or "").strip():
         return True
-    # Full-frame OCR may find centered narration or a chapter card that the
-    # layout parser cannot safely assign to the bottom dialogue box yet. It is
-    # still text for the fallback decision; the caller will record it as
-    # unparsed fallback text and send only one guarded advance.
-    return any(_usable_story_text(line) for line in (parsed.get("unparsed_lines") or []))
+    return False
 
 
 def _common_ocr_focus_regions(
@@ -610,6 +611,23 @@ def record_choice(
         selected_index=selected_index,
         choice_id=choice_id,
         result=result,
+        source=source,
+        session_id=session_id,
+    )
+
+
+@mcp.tool()
+def dismiss_choice(
+    choice_id: str,
+    reason: str = "not_a_choice",
+    source: str = "visual_review",
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Dismiss an OCR choice candidate after visual review without selecting it."""
+
+    return STORE.dismiss_choice(
+        choice_id=choice_id,
+        reason=reason,
         source=source,
         session_id=session_id,
     )
@@ -943,6 +961,7 @@ def _layout_profile_for_capture(
         )
 
     for key, default_space in (
+        ("dialogue_region", "normalized"),
         ("speaker_region", "dialogue_region"),
         ("choice_region", "normalized"),
     ):
@@ -1936,22 +1955,6 @@ def _batch_dialogue_item(payload: dict[str, Any], index: int) -> dict[str, Any] 
     # compact speaker_only marker and let the local loop advance it instead of
     # stopping as if OCR had failed.
     if not dialogue and not choices and not speaker:
-        fallback = payload.get("ocr_fallback") or {}
-        fallback_lines = [
-            str(line).strip()
-            for line in (parsed.get("unparsed_lines") or [])
-            if _usable_story_text(line)
-        ]
-        if fallback.get("full_text_detected") and fallback_lines:
-            return {
-                "index": index,
-                "speaker": None,
-                "dialogue": "\n".join(fallback_lines),
-                "choices": [],
-                "confidence": parsed.get("confidence", 0.0),
-                "text_status": "full_frame_fallback",
-                "unparsed_lines": fallback_lines,
-            }
         return None
     item: dict[str, Any] = {
         "index": index,
@@ -4021,6 +4024,16 @@ def play_until_choice(
             "event_count": len(batch),
             "character_count": batch_chars,
             "reason": "use get_compaction_request instead of returning raw batch text",
+            "raw_batch_stored_locally": True,
+            "next_tool": "get_compaction_request",
+            "candidate_available": bool(
+                compaction_status and compaction_status.get("candidate_available")
+            ),
+            "candidate_block_reason": (
+                compaction_status.get("candidate_block_reason")
+                if compaction_status
+                else None
+            ),
         }
     if transition_waited or transition_probe_count:
         response["transition_wait"] = {

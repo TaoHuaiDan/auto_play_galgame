@@ -35,6 +35,17 @@ CHOICE_PROFILE = {
     },
     "choice_layout": "vertical",
 }
+SPATIAL_PROFILE = {
+    **MARKER_PROFILE,
+    "dialogue_region": {
+        "x": 0.10,
+        "y": 0.70,
+        "width": 0.80,
+        "height": 0.22,
+        "coordinate_space": "normalized",
+    },
+    "choice_min_count": 2,
+}
 
 
 class TextParserTests(unittest.TestCase):
@@ -225,6 +236,82 @@ class TextParserTests(unittest.TestCase):
 
         self.assertEqual(parsed["dialogue"], "yes")
         self.assertEqual(parsed["text_status"], "recognized")
+
+    def test_does_not_classify_save_me_as_ui_residue(self) -> None:
+        parsed = parse_screen_text("Save me")
+
+        self.assertEqual(parsed["dialogue"], "Save me")
+        self.assertEqual(parsed["ui_lines"], [])
+
+    def test_single_bullet_candidate_inside_dialogue_region_is_dialogue(self) -> None:
+        parsed = parse_screen_text(
+            "- Save me",
+            regions=[
+                {"text": "- Save me", "x": 300, "y": 600, "width": 180, "height": 30},
+            ],
+            image_size=(1000, 800),
+            layout_profile=SPATIAL_PROFILE,
+        )
+
+        self.assertEqual(parsed["choices"], [])
+        self.assertEqual(parsed["dialogue"], "Save me")
+
+    def test_single_bullet_chinese_dialogue_is_not_a_choice(self) -> None:
+        parsed = parse_screen_text(
+            "- 吃完晚饭之后，我顺便把澡也洗了。",
+            regions=[
+                {
+                    "text": "- 吃完晚饭之后，我顺便把澡也洗了。",
+                    "x": 120,
+                    "y": 590,
+                    "width": 700,
+                    "height": 34,
+                },
+            ],
+            image_size=(1000, 800),
+            layout_profile=SPATIAL_PROFILE,
+        )
+
+        self.assertEqual(parsed["choices"], [])
+        self.assertEqual(parsed["dialogue"], "吃完晚饭之后，我顺便把澡也洗了。")
+
+    def test_explicit_single_row_choice_profile_can_classify_one_button(self) -> None:
+        profile = {
+            **SPATIAL_PROFILE,
+            "dialogue_region": None,
+            "choice_region": {
+                "x": 0.20,
+                "y": 0.20,
+                "width": 0.60,
+                "height": 0.48,
+                "coordinate_space": "normalized",
+            },
+            "choice_min_count": 1,
+        }
+        parsed = parse_screen_text(
+            "继续",
+            regions=[{"text": "继续", "x": 400, "y": 300, "width": 120, "height": 30}],
+            image_size=(1000, 800),
+            layout_profile=profile,
+        )
+
+        self.assertEqual(parsed["choices"], ["继续"])
+        self.assertEqual(parsed["dialogue"], "")
+
+    def test_text_outside_known_story_regions_is_unknown(self) -> None:
+        parsed = parse_screen_text(
+            "Chapter 1",
+            regions=[
+                {"text": "Chapter 1", "x": 100, "y": 120, "width": 180, "height": 30},
+            ],
+            image_size=(1000, 800),
+            layout_profile=SPATIAL_PROFILE,
+        )
+
+        self.assertEqual(parsed["dialogue"], "")
+        self.assertEqual(parsed["choices"], [])
+        self.assertEqual(parsed["unknown_lines"], ["Chapter 1"])
+        self.assertEqual(parsed["text_status"], "unknown")
 
     def test_configured_marker_profile_does_not_guess_unmarked_colon_ui(self) -> None:
         parsed = parse_screen_text(

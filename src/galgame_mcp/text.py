@@ -67,7 +67,11 @@ def _looks_like_ui_token(token: str) -> bool:
     # Require the same two-character prefix before allowing a fuzzy match, so
     # ordinary short English dialogue is not swallowed by the UI filter.
     for word in _UI_WORDS:
-        if len(normalized) >= 4 and normalized[:2] == word[:2]:
+        if (
+            len(normalized) >= 4
+            and len(normalized) <= len(word) + 1
+            and normalized[:2] == word[:2]
+        ):
             if _within_edit_distance(normalized, word, limit=2):
                 return True
     return False
@@ -110,7 +114,17 @@ def _looks_like_ui_residue(
         ui_hits = max(ui_hits, 1)
     if ui_hits >= 2 and cjk_count <= 3:
         return True
-    if ui_hits >= 1 and len(compact) <= 24 and cjk_count <= 2:
+    # A single control word inside a short phrase is not enough to classify
+    # the whole line as UI.  For example, the perfectly valid English
+    # dialogue ``Save me`` contains ``save`` but is not a SAVE button.  A
+    # lone control token, or a cluster made entirely from control tokens, is
+    # still treated as residue.
+    compact_is_ui_token = _looks_like_ui_token(compact_letters)
+    if ui_hits >= 1 and len(compact) <= 24 and cjk_count <= 2 and (
+        len(words) == 1
+        or compact_is_ui_token
+        or all(_looks_like_ui_token(word) for word in words)
+    ):
         return True
     if any(char in stripped for char in _STORY_PUNCTUATION + "「『【《〈"):
         return False
@@ -146,6 +160,28 @@ def looks_like_ui_residue(
     """
 
     return _looks_like_ui_residue(line, layout_profile)
+
+
+def _is_strong_ui_residue(line: str, layout_profile: dict[str, Any] | None = None) -> bool:
+    """Return only high-confidence UI residue, ignoring ambiguous fragments."""
+
+    stripped = str(line or "").strip()
+    compact = _compact_ocr_text(stripped).casefold()
+    words = re.findall(r"[a-z]+", stripped.casefold())
+    cjk_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\ua960-\ua97f]", compact))
+    compact_letters = re.sub(r"[^a-z0-9]", "", stripped.casefold())
+    ui_hits = sum(1 for word in words if _looks_like_ui_token(word))
+    if _looks_like_ui_token(compact_letters):
+        ui_hits = max(ui_hits, 1)
+    if ui_hits >= 2 and cjk_count <= 3:
+        return True
+    if ui_hits >= 1 and (
+        len(words) == 1
+        or _looks_like_ui_token(compact_letters)
+        or all(_looks_like_ui_token(word) for word in words)
+    ):
+        return True
+    return bool(re.fullmatch(r"\d{2,}", compact))
 
 
 def _marker_specs(profile: dict[str, Any] | None, key: str) -> list[dict[str, Any]]:
@@ -466,15 +502,73 @@ def _choice_line_allowed(
     if not isinstance(layout_profile, dict):
         return True
     choice_bounds = _profile_region_bounds(layout_profile, "choice_region", image_size)
-    if choice_bounds is None:
-        return True
     region = _region_for_line(line, regions)
+    if choice_bounds is None:
+        # When a game has a configured dialogue box but no explicit choice
+        # box, text inside the dialogue box is dialogue by default.  This is
+        # important for OCR artifacts such as ``- 吃完晚饭之后...``: the dash
+        # can make a normal line look like a bullet-prefixed option.  Full
+        # window OCR may still recognize choices outside the dialogue box;
+        # a fast dialogue crop must never promote its own text to a choice.
+        dialogue_bounds = _profile_region_bounds(layout_profile, "dialogue_region", image_size)
+        if dialogue_bounds is not None:
+            if region is None:
+                return layout_profile.get("_capture_scope") != "window_dialogue_region"
+            center = _region_center(region)
+            if center is None:
+                return False
+            return not _point_in_bounds(center, dialogue_bounds)
+        return True
     if region is None:
         # Raw-text callers may not have coordinates; preserve explicit numeric
         # choice parsing instead of silently discarding their input.
         return True
     center = _region_center(region)
     return center is not None and _point_in_bounds(center, choice_bounds)
+
+
+def _dialogue_line_allowed(
+    line: str,
+    regions: list[dict[str, Any]] | None,
+    image_size: tuple[int, int] | None,
+    layout_profile: dict[str, Any] | None,
+) -> bool:
+    """Require ordinary OCR text to come from the configured dialogue box.
+
+    The parser is intentionally permissive for direct/raw-text callers that
+    have no geometry.  Once OCR regions and a game layout are available,
+    text outside every known story box is kept as an unclassified candidate;
+    it must not silently become dialogue.
+    """
+
+    if not isinstance(layout_profile, dict):
+        return True
+    dialogue_bounds = _profile_region_bounds(layout_profile, "dialogue_region", image_size)
+    if dialogue_bounds is None:
+        # A profile that declares only a choice zone still says that text
+        # outside that zone is not safely classifiable as dialogue when OCR
+        # geometry is available.  Raw-text callers without regions retain the
+        # historical permissive behavior.
+        choice_bounds = _profile_region_bounds(layout_profile, "choice_region", image_size)
+        if choice_bounds is not None and regions:
+            return False
+        return True
+    region = _region_for_line(line, regions)
+    if region is None:
+        # A dialogue-only crop is already the configured dialogue box.  For a
+        # full frame, missing geometry is ambiguous and should fail closed.
+        return layout_profile.get("_capture_scope") == "window_dialogue_region"
+    center = _region_center(region)
+    return center is not None and _point_in_bounds(center, dialogue_bounds)
+
+
+def _choice_min_count(layout_profile: dict[str, Any] | None) -> int:
+    """Return the configured minimum number of rows needed for a choice."""
+
+    try:
+        return max(1, min(int((layout_profile or {}).get("choice_min_count", 2)), 10))
+    except (TypeError, ValueError):
+        return 2
 
 
 def _layout_name_label(
@@ -530,10 +624,7 @@ def _layout_choice_keys(
     choice_bounds = _profile_region_bounds(layout_profile, "choice_region", image_size)
     if choice_bounds is None:
         return set()
-    try:
-        minimum_count = max(2, min(int(layout_profile.get("choice_min_count", 2)), 10))
-    except (TypeError, ValueError):
-        minimum_count = 2
+    minimum_count = _choice_min_count(layout_profile)
     choice_layout = str(layout_profile.get("choice_layout") or "vertical").strip().casefold()
     if choice_layout not in {"vertical", "horizontal", "both"}:
         choice_layout = "vertical"
@@ -581,6 +672,12 @@ def _layout_choice_keys(
         )
     if len(candidates) < minimum_count:
         return set()
+
+    # A game profile may explicitly declare that a single centered row is a
+    # valid prompt.  The default remains two rows, so this branch is opt-in
+    # and cannot turn an isolated OCR line into a choice by accident.
+    if minimum_count == 1 and len(candidates) == 1:
+        return {str(candidates[0]["key"])}
 
     selected: list[dict[str, Any]] = []
     for index, first in enumerate(candidates):
@@ -640,7 +737,13 @@ def parse_screen_text(
                 break
         if choice_match:
             if not _choice_line_allowed(line, regions, image_size, profile):
-                unparsed_lines.append(line)
+                if _dialogue_line_allowed(line, regions, image_size, profile):
+                    dialogue_lines.append(
+                        _clean_dialogue_spacing(choice_match.group("label").strip(), profile)
+                    )
+                else:
+                    unparsed_lines.append(line)
+                    unknown_lines.append(line)
                 continue
             choice_records.append(
                 {
@@ -663,7 +766,16 @@ def parse_screen_text(
             continue
 
         if _looks_like_ui_residue(line, profile):
-            ui_lines.append(line)
+            dialogue_allowed = _dialogue_line_allowed(line, regions, image_size, profile)
+            has_geometry = any(
+                isinstance(profile.get(name), dict)
+                for name in ("dialogue_region", "speaker_region", "choice_region")
+            )
+            if has_geometry and regions and not dialogue_allowed and not _is_strong_ui_residue(line, profile):
+                unparsed_lines.append(line)
+                unknown_lines.append(line)
+            else:
+                ui_lines.append(line)
             continue
 
         if speaker is None:
@@ -680,14 +792,26 @@ def parse_screen_text(
                 if remainder:
                     if _looks_like_ui_residue(remainder, profile):
                         ui_lines.append(remainder)
-                    else:
+                    elif _dialogue_line_allowed(
+                        remainder,
+                        regions,
+                        image_size,
+                        profile,
+                    ):
                         dialogue_lines.append(remainder)
+                    else:
+                        unparsed_lines.append(remainder)
+                        unknown_lines.append(remainder)
                 continue
             # A configured dialogue opener has priority over an ambiguous
             # speaker marker. If a game uses the same pair for both roles, it
             # should list that pair only in the role it wants recognized.
             if _starts_with_marker(line, dialogue_markers):
-                dialogue_lines.append(line)
+                if _dialogue_line_allowed(line, regions, image_size, profile):
+                    dialogue_lines.append(line)
+                else:
+                    unparsed_lines.append(line)
+                    unknown_lines.append(line)
                 continue
             colon_match = _COLON_SPEAKER.match(line)
             if colon_match:
@@ -701,7 +825,12 @@ def parse_screen_text(
                 ):
                     speaker = candidate
                     explicit_speaker = True
-                    dialogue_lines.append(colon_match.group("text").strip())
+                    remainder = colon_match.group("text").strip()
+                    if _dialogue_line_allowed(remainder, regions, image_size, profile):
+                        dialogue_lines.append(remainder)
+                    else:
+                        unparsed_lines.append(line)
+                        unknown_lines.append(line)
                     continue
                 if speaker_markers:
                     # Once a game has a configured name-box profile, an
@@ -715,8 +844,30 @@ def parse_screen_text(
         if _starts_with_marker(line, speaker_markers) and not explicit_speaker:
             unparsed_lines.append(line)
             unknown_lines.append(line)
+        elif not _dialogue_line_allowed(line, regions, image_size, profile):
+            unparsed_lines.append(line)
+            unknown_lines.append(line)
         else:
             dialogue_lines.append(line)
+
+    # A single bullet/prefix match is not enough evidence for a choice in a
+    # normal profile.  OCR frequently turns the opening quote of a dialogue
+    # line into ``-`` or another bullet.  Demote that candidate back into the
+    # spatial role it actually occupies; if it is outside every known story
+    # region it remains unknown and blocks autoplay for visual review.
+    minimum_choice_count = _choice_min_count(profile)
+    if choice_records and len(choice_records) < minimum_choice_count:
+        for record in choice_records:
+            raw_candidate = str(record.get("raw") or "").strip()
+            candidate_line = str(record.get("label") or raw_candidate).strip()
+            if not candidate_line:
+                continue
+            if _dialogue_line_allowed(raw_candidate or candidate_line, regions, image_size, profile):
+                dialogue_lines.append(_clean_dialogue_spacing(candidate_line, profile))
+            else:
+                unparsed_lines.append(raw_candidate)
+                unknown_lines.append(raw_candidate)
+        choice_records = []
 
     dialogue = _clean_dialogue_spacing("\n".join(dialogue_lines), profile)
     choices = [record["label"] for record in choice_records]

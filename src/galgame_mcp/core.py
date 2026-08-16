@@ -148,7 +148,10 @@ def _normalise_layout_profile(profile: Any) -> dict[str, Any]:
                 number = int(copied[key])
             except (TypeError, ValueError) as exc:
                 raise SessionError(f"layout_profile.{key} 必须是整数") from exc
-            limits = {"choice_min_count": (2, 10), "speaker_max_chars": (1, 200)}
+            # A profile may explicitly allow a single-option prompt, but the
+            # default remains two rows so one OCR bullet cannot become a
+            # choice by accident.
+            limits = {"choice_min_count": (1, 10), "speaker_max_chars": (1, 200)}
             minimum, maximum = limits[key]
             if not minimum <= number <= maximum:
                 raise SessionError(f"layout_profile.{key} 必须在 {minimum} 到 {maximum} 之间")
@@ -1025,7 +1028,7 @@ class SessionStore:
                 "unresolved_choices": [
                     copy.deepcopy(choice)
                     for choice in session["choices"]
-                    if choice.get("selected_option_id") is None
+                    if choice.get("selected_option_id") is None and not choice.get("dismissed")
                 ],
             }
 
@@ -1148,7 +1151,11 @@ class SessionStore:
         unresolved_ids = {
             str(choice.get("choice_id"))
             for choice in session.get("choices", [])
-            if choice.get("selected_option_id") is None and choice.get("choice_id") is not None
+            if (
+                choice.get("selected_option_id") is None
+                and not choice.get("dismissed")
+                and choice.get("choice_id") is not None
+            )
         }
         # Never cut through an unresolved decision.  The current state keeps
         # the choice too, but retaining its source event makes the first
@@ -1570,6 +1577,8 @@ class SessionStore:
                 ),
                 "result": _clean_text(result),
                 "source": source or "manual",
+                "dismissed": False,
+                "dismiss_reason": None,
                 "updated_at": utc_now(),
             }
         )
@@ -1639,6 +1648,50 @@ class SessionStore:
             )
             self._save_locked(session)
             return {"choice": copy.deepcopy(record), "event": event}
+
+    def dismiss_choice(
+        self,
+        choice_id: str,
+        reason: str = "not_a_choice",
+        source: str = "visual_review",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Mark an OCR choice candidate as visually rejected.
+
+        A false positive is neither an unanswered choice nor a selected
+        option.  Keeping that distinction prevents a bad OCR line from
+        blocking compaction forever or appearing as a route decision.
+        """
+
+        with self._lock:
+            session = self._require_locked(session_id)
+            record = next(
+                (choice for choice in session["choices"] if choice.get("choice_id") == choice_id),
+                None,
+            )
+            if record is None:
+                raise SessionError(f"找不到 choice_id: {choice_id}")
+            if record.get("selected_option_id") is not None:
+                raise SessionError("已选择的 choice 不能标记为误报")
+            record["dismissed"] = True
+            record["dismiss_reason"] = _clean_text(reason) or "not_a_choice"
+            record["result"] = record["dismiss_reason"]
+            record["source"] = source or "visual_review"
+            record["updated_at"] = utc_now()
+            event = self._append_event_locked(
+                session,
+                "choice_dismissed",
+                {"choice_id": choice_id, **copy.deepcopy(record)},
+            )
+            state = session["current_state"]
+            if (
+                state.get("selected_choice_id") == choice_id
+                or state.get("choices") == record.get("options")
+            ):
+                state["choices"] = []
+                state["selected_choice_id"] = None
+            self._save_locked(session)
+            return {"choice": copy.deepcopy(record), "event": event, "current_state": copy.deepcopy(state)}
 
     def record_scene(
         self,
@@ -1887,7 +1940,7 @@ class SessionStore:
             unresolved = [
                 copy.deepcopy(choice)
                 for choice in session["choices"]
-                if choice.get("selected_option_id") is None
+                if choice.get("selected_option_id") is None and not choice.get("dismissed")
             ]
             if compact:
                 recent = [
@@ -1983,6 +2036,7 @@ class SessionStore:
             "dialogue": ("seq", "type", "scene_id", "speaker", "text", "source", "confidence", "noise_flags"),
             "choice": ("seq", "type", "choice_id", "scene_id", "prompt", "options", "selected_option_id", "selected_label", "source"),
             "choice_resolved": ("seq", "type", "choice_id", "selected_index", "selected_label", "source"),
+            "choice_dismissed": ("seq", "type", "choice_id", "dismiss_reason", "source"),
             "scene": ("seq", "type", "scene_id", "location", "background"),
             "scene_observed": ("seq", "type", "scene_id", "location"),
             "state_change": ("seq", "type", "name", "value", "reason"),
@@ -2063,7 +2117,9 @@ class SessionStore:
             "speaker": state.get("speaker"),
             "timeline_count": len(session.get("timeline", [])),
             "unresolved_choice_count": sum(
-                1 for choice in session.get("choices", []) if choice.get("selected_option_id") is None
+                1
+                for choice in session.get("choices", [])
+                if choice.get("selected_option_id") is None and not choice.get("dismissed")
             ),
             "compaction": {
                 "compacted_through_seq": int(compaction.get("compacted_through_seq") or 0),
@@ -2093,7 +2149,9 @@ class SessionStore:
         if variables:
             lines.extend(["", "## 剧情变量", "", "```json", json.dumps(variables, ensure_ascii=False, indent=2), "```"])
         unresolved = [
-            choice for choice in session.get("choices", []) if choice.get("selected_option_id") is None
+            choice
+            for choice in session.get("choices", [])
+            if choice.get("selected_option_id") is None and not choice.get("dismissed")
         ]
         lines.extend(["", "## 待处理选项", ""])
         if unresolved:
@@ -2113,6 +2171,10 @@ class SessionStore:
             elif event_type in {"choice", "choice_resolved"}:
                 selected = event.get("selected_label") or "待选择"
                 lines.append(f"- [{event.get('seq')}] 选项：{selected}")
+            elif event_type == "choice_dismissed":
+                lines.append(
+                    f"- [{event.get('seq')}] 选项误报已驳回：{event.get('dismiss_reason') or 'not_a_choice'}"
+                )
             elif event_type == "scene":
                 lines.append(f"- [{event.get('seq')}] 场景：{event.get('scene_id', '')}")
             elif event_type == "action":

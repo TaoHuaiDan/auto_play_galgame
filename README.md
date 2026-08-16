@@ -346,6 +346,22 @@ py -3 -m unittest discover -s tests -v
 py -3 -m build
 ```
 
+## 角色分类、误报和压缩交互
+
+OCR 文本不会默认全部当作对白。配置了 `dialogue_region` 后，落在对白框内的普通文本才有资格成为 `dialogue`；落在已知选项区的文本才有资格成为 `choice`；其他位置保留在 `unparsed_lines`/`unknown_lines`，Evidence 会将其标记为未分类并阻止自动推进，等待 Codex 视觉复核。
+
+默认至少需要两个有空间关系的选项行才会触发选项状态。单个以短横线、项目符号或 OCR 错误符号开头的对白会按其位置回收到对白，避免把“正常对白 + OCR 误识别的短横线”当成选项。确实存在单选项的游戏可以在 `configure_game_layout` 中显式设置 `choice_min_count=1`。
+
+如果 Codex 视觉复核确认某条候选不是选项，调用：
+
+```text
+dismiss_choice(choice_id="choice_...", reason="false_positive_visual_review")
+```
+
+这会记录“误报已驳回”，不会伪造一个路线选择，也会解除该候选对压缩前缀的保护。
+
+`play_until_choice` 在 `compaction_due` 时故意不返回整批原始对白，以减少 Codex token 消耗；原始事件仍保存在本地 `events.jsonl`。响应会返回 `batch_omitted_for_compaction.next_tool=get_compaction_request`、候选状态和阻塞原因。Codex 应调用 `get_compaction_request` 取得带 SHA-256 校验的有界事件段，写入 `save_compaction` 后再继续游玩。
+
 ## 许可证
 
 本项目使用 [MIT License](LICENSE)。项目不包含任何游戏本体、游戏资源、存档或截图；使用者需要自行确认目标游戏和相关数据的版权、隐私及自动化使用边界。

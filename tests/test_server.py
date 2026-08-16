@@ -1654,7 +1654,7 @@ class BatchPlayTests(unittest.TestCase):
         self.assertEqual(actions[0]["args"][1]["ocr_fallback_settle_seconds"], 1.0)
         self.assertEqual(result["ocr_fallback_settle_seconds"], 1.0)
 
-    def test_play_until_choice_advances_after_unparsed_full_ocr_recovery(self) -> None:
+    def test_play_until_choice_does_not_advance_on_unparsed_full_ocr(self) -> None:
         session = {
             "session_id": "test-session",
             "game": {
@@ -1723,12 +1723,12 @@ class BatchPlayTests(unittest.TestCase):
                 session_id="test-session",
             )
 
-        self.assertEqual(result["stop_reason"], "choice_detected")
-        self.assertEqual(result["steps_advanced"], 1)
-        self.assertEqual(result["batch"][0]["text_status"], "full_frame_fallback")
-        self.assertEqual(result["batch"][0]["dialogue"], "章节过场文字")
-        sleep.assert_any_call(1.0)
-        self.assertEqual(actions[0]["args"][1]["ocr_fallback_settle_seconds"], 1.0)
+        response = json.loads(result[0]) if isinstance(result, list) else result
+        self.assertEqual(response["stop_reason"], "unknown_text_detected")
+        self.assertEqual(response["steps_advanced"], 0)
+        self.assertEqual(response["batch"], [])
+        self.assertFalse(actions)
+        sleep.assert_not_called()
 
     def test_play_until_choice_retries_transient_blank_dialogue(self) -> None:
         session = {

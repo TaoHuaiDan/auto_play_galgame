@@ -87,6 +87,7 @@ class ProtocolTests(unittest.TestCase):
                 "get_compaction_status",
                 "get_compaction_request",
                 "save_compaction",
+                "dismiss_choice",
             }
             <= names
         )

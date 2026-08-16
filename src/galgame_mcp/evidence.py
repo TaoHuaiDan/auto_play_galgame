@@ -164,7 +164,7 @@ def build_frame_evidence(
     unknown_lines = [
         str(item).strip() for item in (parsed.get("unknown_lines") or []) if str(item).strip()
     ]
-    transient_lines = [
+    unclassified_lines = [
         str(item).strip() for item in (parsed.get("unparsed_lines") or []) if str(item).strip()
     ]
     confidence = parsed.get("confidence")
@@ -176,12 +176,15 @@ def build_frame_evidence(
     is_settings = str(screen_type or parsed.get("screen_type") or "").casefold() == "settings"
     # Keep the legacy speaker-only candidate path: some engines render a
     # punctuation-only/very short line after the name label, and Windows OCR
-    # may omit that line.  The autoplay loop still exposes the speaker channel
-    # separately, while genuinely unknown text remains a hard stop.
-    has_story = bool(dialogue or speaker or transient_lines)
+    # may omit that line.  Unclassified text is deliberately *not* story
+    # text: it is a scene-label/unknown candidate and must block autoplay.
+    unknown_candidates: list[str] = []
+    for line in [*unknown_lines, *unclassified_lines]:
+        if line and line not in unknown_candidates:
+            unknown_candidates.append(line)
+    has_story = bool(dialogue or speaker)
     if transition_active is None:
-        transition_active = not has_story and not choices and not unknown_lines and not is_settings
-
+        transition_active = not has_story and not choices and not unknown_candidates and not is_settings
     channels: dict[str, dict[str, Any]] = {
         "dialogue": _channel(
             "stable" if dialogue else "absent",
@@ -201,7 +204,13 @@ def build_frame_evidence(
             blocking=bool(choices),
             details=["choice_pending"] if choices else None,
         ),
-        "scene_label": _channel("absent", resolved=True),
+        "scene_label": _channel(
+            "candidate" if unclassified_lines else "absent",
+            resolved=not unclassified_lines,
+            blocking=bool(unclassified_lines),
+            text="\n".join(unclassified_lines) if unclassified_lines else None,
+            details=["unclassified_text"] if unclassified_lines else None,
+        ),
         "system_ui": _channel(
             "present" if is_settings or ui_lines else "absent",
             resolved=True,
@@ -209,17 +218,19 @@ def build_frame_evidence(
             details=["settings"] if is_settings else ("known_ui_residue",) if ui_lines else None,
         ),
         "transient_story_text": _channel(
-            "present" if transient_lines else "absent",
-            resolved=bool(transient_lines),
-            text="\n".join(transient_lines) if transient_lines else None,
+            "candidate" if unclassified_lines else "absent",
+            resolved=False,
+            blocking=bool(unclassified_lines),
+            text="\n".join(unclassified_lines) if unclassified_lines else None,
             confidence=confidence,
+            details=["unclassified_text"] if unclassified_lines else None,
         ),
         "unknown_text": _channel(
-            "present" if unknown_lines else "absent",
-            resolved=not unknown_lines,
-            blocking=bool(unknown_lines),
-            text="\n".join(unknown_lines) if unknown_lines else None,
-            details=["unknown_text"] if unknown_lines else None,
+            "present" if unknown_candidates else "absent",
+            resolved=not unknown_candidates,
+            blocking=bool(unknown_candidates),
+            text="\n".join(unknown_candidates) if unknown_candidates else None,
+            details=["unknown_text"] if unknown_candidates else None,
         ),
         "visual_transition": _channel(
             "active" if transition_active else "inactive",
@@ -236,9 +247,9 @@ def build_frame_evidence(
         blocking_reasons.append("system_ui")
     if choices:
         blocking_reasons.append("choice_pending")
-    if unknown_lines:
+    if unknown_candidates:
         blocking_reasons.append("unknown_text")
-    if not has_story and not choices and not unknown_lines:
+    if not has_story and not choices and not unknown_candidates:
         blocking_reasons.append("dialogue_unresolved")
 
     safe = not blocking_reasons
@@ -251,7 +262,7 @@ def build_frame_evidence(
             name for name, value in channels.items() if value.get("blocking")
         ],
     }
-    current_text = dialogue or ("\n".join(transient_lines) if transient_lines else "")
+    current_text = dialogue
     if current_text:
         current_episode_id = episode_id(current_text, channel="dialogue")
         if current_episode_id:

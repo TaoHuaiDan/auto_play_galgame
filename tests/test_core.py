@@ -152,6 +152,64 @@ class SessionStoreTests(unittest.TestCase):
                 "text_hash",
             )
 
+    def test_dismissed_choice_is_not_a_route_decision_or_unresolved_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SessionStore(Path(temporary))
+            store.create_session("误报测试", session_id="dismiss-session")
+            recorded = store.record_choice(
+                options=["普通对白被识别成选项"],
+                source="windows_ocr",
+                session_id="dismiss-session",
+            )
+            choice_id = recorded["choice"]["choice_id"]
+
+            dismissed = store.dismiss_choice(
+                choice_id=choice_id,
+                reason="false_positive_visual_review",
+                session_id="dismiss-session",
+            )
+
+            self.assertTrue(dismissed["choice"]["dismissed"])
+            self.assertIsNone(dismissed["choice"]["selected_option_id"])
+            state = store.get_current_state("dismiss-session")
+            self.assertEqual(state["unresolved_choices"], [])
+            self.assertEqual(state["session"]["unresolved_choice_count"], 0)
+            self.assertEqual(dismissed["event"]["type"], "choice_dismissed")
+
+    def test_dismissing_false_choice_releases_compaction_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SessionStore(
+                Path(temporary),
+                compaction_threshold_bytes=16_384,
+                compaction_keep_recent_events=1,
+            )
+            store.create_session("压缩误报测试", session_id="dismiss-compaction")
+            recorded = store.record_choice(
+                options=["对白被误识别成选项"],
+                source="windows_ocr",
+                session_id="dismiss-compaction",
+            )
+            for index in range(4):
+                store.record_dialogue(
+                    f"第 {index} 句 " + ("后续对白" * 1_500),
+                    speaker="角色A",
+                    session_id="dismiss-compaction",
+                )
+
+            blocked = store.compaction_status(session_id="dismiss-compaction")
+            self.assertTrue(blocked["summary_due"])
+            self.assertEqual(blocked["candidate_block_reason"], "unresolved_choice_in_compaction_prefix")
+
+            store.dismiss_choice(
+                choice_id=recorded["choice"]["choice_id"],
+                reason="false_positive_visual_review",
+                session_id="dismiss-compaction",
+            )
+            request = store.get_compaction_request(session_id="dismiss-compaction")
+
+            self.assertIsNotNone(request["request"])
+            self.assertGreater(request["request"]["source"]["event_count"], 0)
+
     def test_codex_compaction_purges_only_validated_raw_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = SessionStore(

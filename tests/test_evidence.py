@@ -44,6 +44,16 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(choice["safe_to_advance"])
         self.assertIn("choice_pending", choice["blocking_reasons"])
 
+    def test_unparsed_text_is_not_resolved_as_transient_story(self) -> None:
+        evidence = build_frame_evidence(
+            {"dialogue": "", "speaker": "", "choices": [], "unparsed_lines": ["Chapter 1"]}
+        )
+
+        self.assertFalse(evidence["safe_to_advance"])
+        self.assertIn("unknown_text", evidence["blocking_reasons"])
+        self.assertFalse(evidence["channels"]["transient_story_text"]["resolved"])
+        self.assertTrue(evidence["channels"]["scene_label"]["blocking"])
+
 
 if __name__ == "__main__":
     unittest.main()
