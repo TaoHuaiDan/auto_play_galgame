@@ -43,6 +43,8 @@ windows-ocr = [
     "winrt-Windows.Storage.Streams>=3.2.1,<4.0.0; platform_system == 'Windows'",
     "winrt-Windows.Globalization>=3.2.1,<4.0.0; platform_system == 'Windows'",
 ]
+# Kept as a compatibility extra for optional Pillow-based transition motion
+# scoring; the server no longer uses it for automatic 2x OCR.
 ocr-focus = [
     "Pillow>=10,<13",
 ]

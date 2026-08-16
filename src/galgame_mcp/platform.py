@@ -34,6 +34,8 @@ _OCR_WORKER_THREAD: threading.Thread | None = None
 _RAPIDOCR_ENGINE_LOCK = threading.Lock()
 _RAPIDOCR_ENGINE: Any | None = None
 _RAPIDOCR_INIT_ERROR: Exception | None = None
+_RAPIDOCR_RUNTIME_PRELOADED = False
+_RAPIDOCR_RUNTIME_ERROR: Exception | None = None
 
 
 def _enable_windows_dpi_awareness() -> None:
@@ -1472,6 +1474,30 @@ def _run_windows_ocr(path: Path, language: str, timeout_sec: int) -> dict[str, A
     return _windows_ocr_error_result(RuntimeError("Windows OCR 工作线程没有返回结果。"))
 
 
+def _preload_rapidocr_runtime() -> None:
+    """Load ONNX Runtime before WinRT OCR can alter native DLL resolution.
+
+    Windows OCR remains the primary backend.  RapidOCR's model is still lazy,
+    but importing its native runtime once before the first WinRT call avoids a
+    real Windows-only failure where the later fallback cannot load
+    ``onnxruntime_pybind11_state``.  Missing optional dependencies are cached
+    and never prevent Windows OCR from running.
+    """
+
+    global _RAPIDOCR_RUNTIME_PRELOADED, _RAPIDOCR_RUNTIME_ERROR
+    if _RAPIDOCR_RUNTIME_PRELOADED or _RAPIDOCR_RUNTIME_ERROR is not None:
+        return
+    with _RAPIDOCR_ENGINE_LOCK:
+        if _RAPIDOCR_RUNTIME_PRELOADED or _RAPIDOCR_RUNTIME_ERROR is not None:
+            return
+        try:
+            importlib.import_module("onnxruntime")
+        except Exception as exc:  # optional fallback; Windows OCR still runs
+            _RAPIDOCR_RUNTIME_ERROR = exc
+        else:
+            _RAPIDOCR_RUNTIME_PRELOADED = True
+
+
 def ocr_image(image_path: str, language: str = "auto", psm: int = 6, timeout_sec: int = 30) -> dict[str, Any]:
     """Run local OCR, preferring Windows OCR and falling back to Tesseract."""
 
@@ -1497,6 +1523,7 @@ def ocr_image(image_path: str, language: str = "auto", psm: int = 6, timeout_sec
     preference = os.environ.get("GALGAME_MCP_OCR_BACKEND", "auto").strip().casefold()
     attempts: list[dict[str, Any]] = []
     if preference in {"auto", "windows", "windows_ocr"} and sys.platform == "win32":
+        _preload_rapidocr_runtime()
         windows_result = _run_windows_ocr(path, language=language, timeout_sec=timeout)
         windows_result["image_path"] = str(path)
         if windows_result.get("status") == "ok":
@@ -1669,9 +1696,10 @@ def rapidocr_image(image_path: str, language: str = "auto", timeout_sec: int = 3
 
     engine, init_error = _rapidocr_engine()
     if engine is None:
-        missing = _RAPIDOCR_INIT_ERROR is not None and isinstance(
-            _RAPIDOCR_INIT_ERROR, (ImportError, ModuleNotFoundError)
-        )
+        # A DLL initialization failure is an ImportError too, but it means the
+        # optional backend was installed and failed at runtime.  Only a real
+        # missing-module exception should be reported as missing_dependency.
+        missing = isinstance(_RAPIDOCR_INIT_ERROR, ModuleNotFoundError)
         return finish(
             {
                 "available": not missing,

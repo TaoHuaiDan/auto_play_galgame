@@ -13,6 +13,7 @@ from galgame_mcp.platform import (
     _send_mouse_event,
     _send_mouse_move,
     hold_key,
+    ocr_image,
     post_window_click,
     post_window_key,
     post_window_wheel,
@@ -104,6 +105,51 @@ class PlatformBufferTests(unittest.TestCase):
         self.assertEqual(result["text"], "「……？」")
         self.assertEqual(result["regions"][0]["x"], 4.0)
         self.assertEqual(result["regions"][0]["width"], 100.0)
+
+    def test_windows_ocr_preloads_onnx_runtime_before_first_request(self) -> None:
+        order: list[str] = []
+
+        def preload() -> None:
+            order.append("onnxruntime")
+
+        def windows(_path: object, *, language: str, timeout_sec: int) -> dict[str, object]:
+            order.append("windows_ocr")
+            return {
+                "available": True,
+                "execution_success": True,
+                "usable": True,
+                "status": "ok",
+                "backend": "windows_ocr",
+                "text": "对白",
+                "regions": [],
+            }
+
+        with tempfile.NamedTemporaryFile(suffix=".png") as image, patch.object(
+            platform_module.sys, "platform", "win32"
+        ), patch.object(
+            platform_module, "_preload_rapidocr_runtime", side_effect=preload
+        ) as preload_call, patch.object(
+            platform_module, "_run_windows_ocr", side_effect=windows
+        ):
+            result = ocr_image(image.name)
+
+        self.assertEqual(result["backend"], "windows_ocr")
+        self.assertEqual(order, ["onnxruntime", "windows_ocr"])
+        preload_call.assert_called_once_with()
+
+    def test_rapidocr_dll_failure_is_not_reported_as_missing_dependency(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".png") as image, patch.object(
+            platform_module, "_RAPIDOCR_ENGINE", None
+        ), patch.object(
+            platform_module,
+            "_RAPIDOCR_INIT_ERROR",
+            ImportError("DLL load failed while importing onnxruntime_pybind11_state"),
+        ):
+            result = rapidocr_image(image.name)
+
+        self.assertEqual(result["status"], "init_error")
+        self.assertTrue(result["available"])
+        self.assertFalse(result["execution_success"])
 
 
 class BackgroundWindowMessageTests(unittest.TestCase):

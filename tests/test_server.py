@@ -1863,7 +1863,7 @@ class BatchPlayTests(unittest.TestCase):
         self.assertEqual(capture.call_count, 2)
         advance.assert_called_once()
 
-    def test_unresolved_full_ocr_requests_visual_review(self) -> None:
+    def test_unresolved_full_ocr_requests_visual_review_after_rapidocr(self) -> None:
         profile = {
             "dialogue_region": {
                 "x": 0.10,
@@ -1888,22 +1888,28 @@ class BatchPlayTests(unittest.TestCase):
         }
         primary = {
             "available": True,
-            "status": "ok",
+            "execution_success": False,
+            "usable": False,
+            "status": "error",
             "backend": "windows_ocr",
-            "text": "SAVE LOAD SYSTEM",
-            "regions": [{"text": "SAVE LOAD SYSTEM", "x": 100, "y": 700, "width": 200, "height": 24}],
-        }
-        focused = {
-            "available": True,
-            "status": "empty",
-            "backend": "focused_ocr",
             "text": "",
             "regions": [],
-            "attempts": [{"label": "dialogue", "status": "empty"}],
+            "message": "Windows OCR failed",
+        }
+        rapid = {
+            "available": True,
+            "execution_success": True,
+            "usable": False,
+            "status": "empty",
+            "backend": "rapidocr_ppocrv6_small",
+            "model": "PP-OCRv6-small-ONNX",
+            "text": "",
+            "regions": [],
+            "elapsed_ms": 28.4,
         }
         with patch("galgame_mcp.server.native_ocr_image", return_value=primary), patch(
-            "galgame_mcp.server.native_focused_ocr_image", return_value=focused
-        ) as focused_call:
+            "galgame_mcp.server.native_rapidocr_image", return_value=rapid
+        ) as rapid_call:
             processed = _process_local_text(
                 payload,
                 Path("C:/full.png"),
@@ -1911,18 +1917,20 @@ class BatchPlayTests(unittest.TestCase):
                 ocr=True,
                 record_text=False,
                 language="auto",
-                include_raw_text=True,
-                ocr_region=profile["dialogue_region"],
+                include_raw_text=False,
+                ocr_region=None,
             )
 
         self.assertTrue(processed["ocr_uncertain"]["required"])
         self.assertEqual(processed["ocr_uncertain"]["status"], "needs_codex_visual_review")
         self.assertIn("ocr_uncertain", processed["evidence"]["blocking_reasons"])
-        focused_call.assert_called_once()
-        self.assertEqual(focused_call.call_args.args[1][0]["label"], "dialogue")
-        self.assertEqual(processed["ocr_focus"]["mode"], "profile_region_zoom")
+        self.assertEqual(processed["ocr_backends"]["windows_ocr"]["execution_success"], False)
+        self.assertEqual(processed["ocr_backends"]["windows_ocr"]["story_usable"], False)
+        self.assertEqual(processed["ocr_backends"]["rapidocr_ppocrv6_small"]["elapsed_ms"], 28.4)
+        self.assertFalse(processed["ocr_backends"]["rapidocr_ppocrv6_small"]["story_usable"])
+        rapid_call.assert_called_once_with(str(Path("C:/full.png").resolve()), language="auto")
 
-    def test_focused_ocr_can_recover_a_short_punctuation_line(self) -> None:
+    def test_rapidocr_recovers_full_window_punctuation_dialogue(self) -> None:
         profile = {
             "dialogue_region": {
                 "x": 0.10,
@@ -1939,128 +1947,6 @@ class BatchPlayTests(unittest.TestCase):
             "width": 1000,
             "height": 800,
             "window": {"x": 0, "y": 0, "width": 1000, "height": 800},
-        }
-        session = {
-            "session_id": "test-session",
-            "current_state": {},
-            "game": {"layout_profile": profile},
-        }
-        primary = {
-            "available": True,
-            "status": "ok",
-            "backend": "windows_ocr",
-            "text": "SAVE LOAD SYSTEM",
-            "regions": [{"text": "SAVE LOAD SYSTEM", "x": 100, "y": 700, "width": 200, "height": 24}],
-        }
-        focused = {
-            "available": True,
-            "status": "ok",
-            "backend": "focused_ocr",
-            "text": "【七海&晓】\n「……」",
-            "regions": [
-                {"text": "【七海&晓】", "x": 300, "y": 580, "width": 150, "height": 32},
-                {"text": "「……」", "x": 300, "y": 640, "width": 180, "height": 36},
-            ],
-            "scale": 2.0,
-            "attempts": [{"label": "dialogue", "status": "ok"}],
-        }
-        with patch("galgame_mcp.server.native_ocr_image", return_value=primary), patch(
-            "galgame_mcp.server.native_focused_ocr_image", return_value=focused
-        ):
-            processed = _process_local_text(
-                payload,
-                Path("C:/full.png"),
-                session,
-                ocr=True,
-                record_text=False,
-                language="auto",
-                include_raw_text=True,
-                ocr_region=profile["dialogue_region"],
-            )
-
-        self.assertEqual(processed["processed_text"]["speaker"], "七海&晓")
-        self.assertEqual(processed["processed_text"]["dialogue"], "「……」")
-        self.assertNotIn("ocr_uncertain", processed)
-        self.assertEqual(processed["ocr_focus"]["mode"], "profile_region_zoom")
-
-    def test_focused_ocr_text_without_bbox_uses_single_focus_region(self) -> None:
-        profile = {
-            "dialogue_region": {
-                "x": 0.10,
-                "y": 0.70,
-                "width": 0.80,
-                "height": 0.25,
-                "coordinate_space": "normalized",
-            },
-            "speaker_markers": [{"open": "【", "close": "】"}],
-            "dialogue_markers": [{"open": "「", "close": "」"}],
-        }
-        payload = {
-            "capture_scope": "window_full",
-            "width": 1000,
-            "height": 800,
-            "window": {"x": 0, "y": 0, "width": 1000, "height": 800},
-        }
-        session = {
-            "session_id": "test-session",
-            "current_state": {},
-            "game": {"layout_profile": profile},
-        }
-        primary = {
-            "available": True,
-            "status": "ok",
-            "backend": "windows_ocr",
-            "text": "VOICE AUTO",
-            "regions": [],
-        }
-        # Some Windows OCR results retain aggregate text but expose no word
-        # boxes. With one configured focus region, that crop is still a valid
-        # spatial gate for this punctuation-only dialogue.
-        focused = {
-            "available": True,
-            "status": "ok",
-            "backend": "focused_ocr",
-            "text": "「……」",
-            "regions": [],
-            "attempts": [{"label": "dialogue", "status": "ok", "char_count": 3}],
-        }
-        with patch("galgame_mcp.server.native_ocr_image", return_value=primary), patch(
-            "galgame_mcp.server.native_focused_ocr_image", return_value=focused
-        ):
-            processed = _process_local_text(
-                payload,
-                Path("C:/full.png"),
-                session,
-                ocr=True,
-                record_text=False,
-                language="auto",
-                include_raw_text=True,
-                ocr_region=profile["dialogue_region"],
-            )
-
-        self.assertEqual(processed["processed_text"]["dialogue"], "「……」")
-        self.assertEqual(processed["ocr_focus"]["spatial_region_count"], 1)
-        self.assertEqual(processed["ocr_focus"]["synthetic_region_count"], 1)
-        self.assertNotIn("ocr_uncertain", processed)
-
-    def test_rapidocr_is_same_frame_fallback_for_dialogue_region(self) -> None:
-        profile = {
-            "dialogue_region": {
-                "x": 0.10,
-                "y": 0.70,
-                "width": 0.80,
-                "height": 0.25,
-                "coordinate_space": "normalized",
-            },
-            "speaker_markers": [{"open": "【", "close": "】"}],
-            "dialogue_markers": [{"open": "「", "close": "」"}],
-        }
-        payload = {
-            "capture_scope": "window_dialogue_region",
-            "width": 800,
-            "height": 200,
-            "window": {"x": 100, "y": 50, "width": 1000, "height": 800},
-            "capture_region": {"x": 100, "y": 610, "width": 800, "height": 200},
         }
         session = {
             "session_id": "test-session",
@@ -2070,12 +1956,11 @@ class BatchPlayTests(unittest.TestCase):
         primary = {
             "available": True,
             "execution_success": True,
-            "usable": False,
+            "usable": True,
             "status": "ok",
             "backend": "windows_ocr",
-            "text": "VOICE AUTO",
-            "regions": [],
-            "elapsed_ms": 12.5,
+            "text": "SAVE LOAD SYSTEM",
+            "regions": [{"text": "SAVE LOAD SYSTEM", "x": 100, "y": 700, "width": 200, "height": 24}],
         }
         rapid = {
             "available": True,
@@ -2086,13 +1971,56 @@ class BatchPlayTests(unittest.TestCase):
             "model": "PP-OCRv6-small-ONNX",
             "text": "【晓】\n「……？」",
             "regions": [
-                {"text": "【晓】", "x": 220, "y": 20, "width": 80, "height": 24},
-                {"text": "「……？」", "x": 220, "y": 70, "width": 150, "height": 28},
+                {"text": "【晓】", "x": 300, "y": 580, "width": 80, "height": 24},
+                {"text": "「……？」", "x": 300, "y": 640, "width": 150, "height": 28},
             ],
             "elapsed_ms": 28.4,
         }
         with patch("galgame_mcp.server.native_ocr_image", return_value=primary), patch(
             "galgame_mcp.server.native_rapidocr_image", return_value=rapid
+        ) as rapid_call:
+            processed = _process_local_text(
+                payload,
+                Path("C:/full.png"),
+                session,
+                ocr=True,
+                record_text=False,
+                language="auto",
+                include_raw_text=True,
+                ocr_region=profile["dialogue_region"],
+            )
+
+        self.assertEqual(processed["processed_text"]["dialogue"], "「……？」")
+        self.assertEqual(processed["processed_text"]["speaker"], "晓")
+        self.assertEqual(processed["ocr"]["backend"], "rapidocr_ppocrv6_small")
+        self.assertTrue(processed["ocr_backends"]["rapidocr_ppocrv6_small"]["story_usable"])
+        self.assertNotIn("ocr_uncertain", processed)
+        rapid_call.assert_called_once_with(str(Path("C:/full.png").resolve()), language="auto")
+
+    def test_rapidocr_is_not_called_on_fast_dialogue_region(self) -> None:
+        payload = {
+            "capture_scope": "window_dialogue_region",
+            "width": 800,
+            "height": 200,
+            "window": {"x": 100, "y": 50, "width": 1000, "height": 800},
+            "capture_region": {"x": 100, "y": 610, "width": 800, "height": 200},
+        }
+        session = {
+            "session_id": "test-session",
+            "current_state": {},
+            "game": {"layout_profile": {}},
+        }
+        primary = {
+            "available": True,
+            "execution_success": True,
+            "usable": True,
+            "status": "ok",
+            "backend": "windows_ocr",
+            "text": "VOICE AUTO",
+            "regions": [],
+        }
+        with patch("galgame_mcp.server.native_ocr_image", return_value=primary), patch(
+            "galgame_mcp.server.native_rapidocr_image"
         ) as rapid_call:
             processed = _process_local_text(
                 payload,
@@ -2105,15 +2033,9 @@ class BatchPlayTests(unittest.TestCase):
                 ocr_region=None,
             )
 
-        self.assertEqual(processed["processed_text"]["dialogue"], "「……？」")
-        self.assertEqual(processed["processed_text"]["speaker"], "晓")
-        self.assertEqual(processed["ocr"]["backend"], "rapidocr_ppocrv6_small")
-        self.assertEqual(processed["ocr_backends"]["windows_ocr"]["execution_success"], True)
-        self.assertEqual(processed["ocr_backends"]["windows_ocr"]["story_usable"], False)
-        self.assertEqual(processed["ocr_backends"]["rapidocr_ppocrv6_small"]["elapsed_ms"], 28.4)
-        self.assertTrue(processed["ocr_backends"]["rapidocr_ppocrv6_small"]["story_usable"])
-        self.assertNotIn("ocr_uncertain", processed)
-        rapid_call.assert_called_once_with(str(Path("C:/dialogue-crop.png").resolve()), language="auto")
+        rapid_call.assert_not_called()
+        self.assertNotIn("ocr_backends", processed)
+        self.assertNotIn("ocr_focus", processed)
 
     def test_batch_keeps_recognized_punctuation_only_dialogue(self) -> None:
         item = _batch_dialogue_item(

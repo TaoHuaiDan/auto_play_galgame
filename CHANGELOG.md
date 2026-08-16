@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Changed OCR fallback routing so fast dialogue captures use Windows OCR only;
+  an unusable full-window Windows OCR result now triggers one same-frame
+  RapidOCR PP-OCRv6-small ONNX fallback, with the old 2x focused pass removed
+  from the automatic flow. ONNX Runtime is preloaded before WinRT OCR to avoid
+  a Windows DLL initialization-order failure when the fallback is needed.
 - Added the `configure_game_layout` MCP tool and persisted per-session layout
   profiles for dialogue regions, speaker/choice regions, and game-specific OCR
   marker pairs. The parser no longer infers current-game symbols from a window

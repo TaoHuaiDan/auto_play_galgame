@@ -32,10 +32,10 @@ py -3 -m pip install -e ".[windows-ocr]"
 
 该可选依赖调用 Windows 自带 OCR，OCR 和文本解析均在本机完成；未安装时仍可使用手动记录，或显式 `include_image=true` 让 Codex 视觉兜底。
 
-如果希望启用“正常全窗口 OCR 失败后，对已配置区域放大一次再识别”的保底，再安装：
+如果希望启用“完整窗口 Windows OCR 失败后”的 RapidOCR 保底，再安装：
 
 ```powershell
-py -3 -m pip install -e ".[windows-ocr,ocr-focus]"
+py -3 -m pip install -e ".[windows-ocr,rapidocr]"
 ```
 
 开发和打包检查可以安装：
@@ -240,17 +240,15 @@ record_parsed_text(raw_text="...", screenshot_path="...")
 
 如果不希望游戏抢到前台，可使用 `background_press_key`、`background_click`、`background_scroll`；`advance_game`、`play_until_choice` 和 `select_choice` 默认使用后台窗口消息，需要前台输入时显式传 `background=false`。底层 `background_*` 接口默认用 `delivery="post"` 通过 `PostMessageW` 排队；高层自动游玩工具的后台输入默认用 `background_input_method="send"`，通过带超时的 `SendMessageTimeoutW` 直接调用窗口过程，实测对本游戏更可靠。两种方式都不调用 `SetForegroundWindow`、不移动真实鼠标；`queued=true`/`delivered=true` 只代表系统层结果，不代表游戏一定执行了动作。只读 Win32 消息的引擎适合这几条路径；Raw Input、DirectInput、部分 Unity/独占渲染输入路径可能忽略它们，此时应显式回退到前台 `SendInput` 或游戏专用适配器。窗口消息点击和滚轮的坐标使用屏幕坐标，MCP 会在本地转换鼠标移动消息的客户区坐标。`click_screen(input_method="touch")` 还提供显式 Windows 触摸注入备用路径。后台模式下设置页恢复也使用窗口消息点击；如果未找到明确“回到游戏/返回游戏”按钮，仍不会猜测输入。
 
-完整窗口 OCR 先正常识别。已经配置 `dialogue_region` 的游戏在快速对白区域中，如果 Windows OCR 已经完成但没有得到可用的剧情语义，会在同一张对白区域截图上调用可选的 RapidOCR PP-OCRv6-small ONNX 后端；两个后端的状态、可用性、识别结果摘要和耗时会记录在 `ocr_backends`。RapidOCR 识别成功且解析出对白/选项时才替换当前结果，否则继续原有的完整窗口 OCR 保底流程。正常全窗口 OCR 没有可用故事文本时，仍只会把当前游戏 profile 的对白框、姓名框和选项区分别放大 2 倍，再调用同一个本地 OCR 一次。仍无法确认时，MCP 会保存并返回截图，标记 `ocr_uncertain`，由 Codex 进行一次视觉复核，自动游玩在此处停止。不会做全屏候选搜索、对比度增强或多轮重试。
+完整窗口 OCR 先正常使用 Windows OCR。已配置 `dialogue_region` 的游戏会先走快速对白区域；快速区域为空、只有人物名或只有 VOICE/AUTO 等界面残留时，MCP 会捕获完整窗口并再次使用 Windows OCR。只有完整窗口 Windows OCR 仍没有可用剧情文本时，才会在同一张完整窗口截图上调用可选的 RapidOCR PP-OCRv6-small ONNX 后端。RapidOCR 只作为识别失败保底，不参与快速区域的正常路径，也不再执行旧的 2 倍 focused OCR。两个后端的执行状态、可用性、解析是否足以作为剧情文本和耗时会记录在 `ocr_backends`；RapidOCR 成功且解析出对白/选项时才替换当前结果。仍无法确认时，MCP 会保存并返回截图，标记 `ocr_uncertain`，由 Codex 进行一次视觉复核，自动游玩在此处停止。不会做全屏候选搜索、对比度增强或多轮重试。
 
 RapidOCR 是可选后端，不改变现有 Windows OCR 返回结构。安装：
 
 ```powershell
-py -3 -m pip install -e ".[windows-ocr,ocr-focus,rapidocr]"
+py -3 -m pip install -e ".[windows-ocr,rapidocr]"
 ```
 
-`rapidocr>=3.9` 默认使用 PP-OCRv6 small 检测/识别模型；本项目额外安装 `onnxruntime`，保持推理在本地 CPU 完成。`execution_success` 表示后端是否完成了一次调用，`usable` 表示是否返回了文本或区域，`story_usable` 才表示当前解析结果是否足以作为剧情文本。后端可用但返回空结果时不会被误报成执行失败。
-
-Windows OCR 有时会返回 focused 区域的文字却不给 word bounding box。MCP 会保留该次配置区域作为合成空间证据；返回的 `ocr_focus.spatial_region_count` 和 `synthetic_region_count` 可用于诊断。这只补救 focused OCR 的空间归属，无法替代 OCR 引擎本身完全漏掉文字的情况。
+`rapidocr>=3.9` 默认使用 PP-OCRv6 small 检测/识别模型；本项目额外安装 `onnxruntime`，保持推理在本地 CPU 完成。首次 Windows OCR 前会预加载 ONNX Runtime 的本地 DLL，但不会初始化 RapidOCR 模型，因此正常 Windows OCR 仍保持快速；只有保底真正触发时才承担 RapidOCR 的模型初始化和推理耗时。`execution_success` 表示后端是否完成了一次调用，`usable` 表示是否返回了文本或区域，`story_usable` 才表示当前解析结果是否足以作为剧情文本。后端可用但返回空结果时不会被误报成执行失败。
 
 更接近无人值守的通用流程是：
 
