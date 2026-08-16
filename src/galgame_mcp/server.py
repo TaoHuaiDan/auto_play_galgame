@@ -3804,8 +3804,8 @@ def play_until_choice(
                 stop_reason = "settings_return_button_not_detected"
                 break
             probe_choices = list((probe_payload.get("processed_text") or {}).get("choices") or [])
+            probe_item = _batch_dialogue_item(probe_payload, len(batch) + 1)
             if probe_choices:
-                probe_item = _batch_dialogue_item(probe_payload, len(batch) + 1)
                 if probe_item is not None:
                     probe_key = (
                         str(probe_item.get("speaker") or "旁白"),
@@ -3816,6 +3816,21 @@ def play_until_choice(
                         batch.append(probe_item)
                 stop_reason = "choice_detected"
                 break
+            if probe_item is not None:
+                probe_key = (
+                    str(probe_item.get("speaker") or "旁白"),
+                    str(probe_item.get("dialogue") or ""),
+                    tuple(str(choice) for choice in (probe_item.get("choices") or [])),
+                )
+                if probe_key != item_key and _bottom_text_snapshot(probe_payload).get("detected"):
+                    # The full-window probe may recover a new dialogue frame
+                    # while the fast crop still returns the previous line.
+                    # Reuse that exact probe on the next iteration instead of
+                    # treating a successful OCR recovery as a stalled game.
+                    pending_frame = (probe_payload, probe_image_path)
+                    last_item_key = None
+                    unchanged_item_frames = 0
+                    continue
             stop_reason = "dialogue_not_advancing"
             break
         if item_key not in seen_items:

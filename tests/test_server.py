@@ -1540,6 +1540,90 @@ class BatchPlayTests(unittest.TestCase):
         self.assertEqual(result["steps_advanced"], 2)
         probe.assert_called_once()
 
+    def test_repeated_dialogue_probe_reuses_new_full_window_dialogue(self) -> None:
+        session = {
+            "session_id": "test-session",
+            "game": {
+                "window_title": "测试游戏",
+                "control": {"advance_key": "SPACE"},
+            },
+            "current_state": {},
+        }
+        repeated_frame = {
+            "capture_scope": "window_dialogue_region",
+            "width": 700,
+            "height": 180,
+            "window": {"x": 0, "y": 0, "width": 1000, "height": 800},
+            "ocr": {"available": True},
+            "processed_text": {
+                "speaker": "将臣",
+                "dialogue": "旧对白",
+                "choices": [],
+                "confidence": 0.9,
+            },
+        }
+        recovered_frame = {
+            "capture_scope": "window_full",
+            "width": 1000,
+            "height": 800,
+            "window": {"x": 0, "y": 0, "width": 1000, "height": 800},
+            "ocr": {"available": True},
+            "_dialogue_ocr_regions": [{"text": "新对白", "y": 700, "height": 30}],
+            "processed_text": {
+                "speaker": "将臣",
+                "dialogue": "新对白",
+                "choices": [],
+                "confidence": 0.9,
+            },
+        }
+        choice_frame = {
+            **recovered_frame,
+            "processed_text": {
+                "speaker": None,
+                "dialogue": "",
+                "choices": ["选项一", "选项二"],
+            },
+        }
+        frames = [repeated_frame, repeated_frame, repeated_frame, choice_frame]
+        capture_index = 0
+        actions: list[dict[str, object]] = []
+
+        def capture_frame(**_kwargs: object) -> tuple[dict[str, object], Path]:
+            nonlocal capture_index
+            index = min(capture_index, len(frames) - 1)
+            capture_index += 1
+            return frames[index], Path(f"C:/recovery-{index}.png")
+
+        with patch("galgame_mcp.server.STORE.get_session", return_value=session), patch(
+            "galgame_mcp.server._capture_processed_frame", side_effect=capture_frame
+        ), patch(
+            "galgame_mcp.server._probe_full_window_for_choices",
+            return_value=(recovered_frame, Path("C:/recovered.png")),
+        ), patch(
+            "galgame_mcp.server._auto_return_from_settings",
+            side_effect=lambda payload, *_args, **_kwargs: (payload, Path("C:/frame.png")),
+        ), patch(
+            "galgame_mcp.server._advance_input_for_batch",
+            return_value=("background_click", {"queued": True}),
+        ), patch(
+            "galgame_mcp.server.STORE.record_action",
+            side_effect=lambda *_args, **kwargs: actions.append(kwargs) or {"event_id": "action-1"},
+        ), patch("galgame_mcp.server._remember_bottom_snapshot"):
+            result = server_play_until_choice(
+                max_steps=10,
+                wait_seconds=0,
+                record_text=False,
+                session_id="test-session",
+            )
+
+        self.assertEqual(result["stop_reason"], "choice_detected")
+        self.assertEqual(result["steps_advanced"], 3)
+        self.assertEqual(
+            [item["dialogue"] for item in result["batch"][:2]],
+            ["旧对白", "新对白"],
+        )
+        self.assertEqual(result["batch"][-1]["choices"], ["选项一", "选项二"])
+
     def test_play_until_choice_advances_speaker_only_frame(self) -> None:
         session = {
             "session_id": "test-session",
