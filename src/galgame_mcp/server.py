@@ -372,6 +372,8 @@ mcp = FastMCP(
         "ocr_ignore_regions 可按坐标过滤确认无关的标题栏、固定 Logo 或底部 UI，ocr_blacklist 可按 exact/contains/regex 过滤固定 OCR 文本；动态章节标题不要整块忽略；"
         "过滤项仍保留在 raw_text、ignored_lines 和 evidence 中，不能覆盖对白或选项区域。"
         "推进后对白框暂时为空时，advance_game/play_until_choice 会在 transition_wait_seconds 的有界等待窗口内本地重试；默认不会发送额外点击。"
+        "若 profile 没有 choice_region，只有在对白框空白或连续不变后触发的完整窗口选项探测会临时推断对白框上方至少两行对齐文字；"
+        "普通对白 OCR 不启用这条兜底，候选会记录并停下交给 Codex，不会直接点击。"
         "只有配置 transition_accelerate=true 且完整窗口连续探测确认画面发生明显转场时，才最多额外点击一次；稳定画面 OCR 为空仍返回 ocr_uncertain。"
         "等待策略通过 configure_game_timing 按游戏配置；fixed 适合关闭打字机动画的游戏，text_hash 会要求点击后底部文本先变化并连续稳定若干次，才允许下一次输入。"
         "需要连续无人值守推进时使用 play_until_choice；默认不设步数或 batch 字符上限，"
@@ -383,6 +385,10 @@ mcp = FastMCP(
         "当 get_codex_context 返回 compaction.summary_due=true 时，调用 get_compaction_request 取得一个有界原始事件段，"
         "由 Codex 按 summary_contract 生成详细结构化总结，再调用 save_compaction；只有校验通过后 MCP 才会清除对应的原始事件，"
         "并删除不再被活动状态引用的 frames 原始截图，保留 compactions/ 下的省流文件。"
+        "真实游戏选项是语义大检查点边界：先记录选择前的共通剧情、当前状态和全部候选项，"
+        "再把选择后的内容作为带 parent_checkpoint_id、choice_node_id 和 route_id 的分支增量保存。"
+        "player_choice 必须与剧情人物的 narrative_decision 分开；重新游玩其他选项时建立新路线，不能覆盖原路线。"
+        "可调用 save_story_checkpoint 保存这种大检查点；它只新增上层省流索引，不删除底层 compactions 段落。"
     ),
 )
 
@@ -1047,6 +1053,8 @@ def _layout_profile_for_capture(
             )
         profile["ocr_ignore_regions"] = projected_ignore_regions
     profile["_capture_scope"] = capture_scope
+    if payload.get("_choice_probe"):
+        profile["_choice_probe"] = True
     return profile
 
 
@@ -2478,6 +2486,8 @@ def _auto_return_from_settings(
         capture_mode=capture_mode,
         session_id=session["session_id"],
     )
+    if payload.get("_choice_probe"):
+        followup["_choice_probe"] = True
     if payload.get("action_event") is not None:
         followup["action_event"] = payload["action_event"]
     followup["auto_recovery"] = {
@@ -3356,6 +3366,11 @@ def _probe_full_window_for_choices(
         session_id=session["session_id"],
         fast_region=None,
     )
+    # Tell the parser that this is the guarded full-window choice pass. It
+    # may infer unprefixed, vertically aligned option rows above the dialogue
+    # box when the profile has not supplied an explicit choice_region. The
+    # marker is intentionally absent from ordinary full-window OCR.
+    payload["_choice_probe"] = True
     payload = _process_capture_text(
         payload,
         image_path,
@@ -4814,6 +4829,16 @@ def save_compaction(
         summary=summary,
         session_id=session_id,
     )
+
+
+@mcp.tool()
+def save_story_checkpoint(
+    checkpoint: dict[str, Any],
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """保存共通线/分支路线语义大检查点，不覆盖底层段落摘要。"""
+
+    return STORE.save_story_checkpoint(checkpoint=checkpoint, session_id=session_id)
 
 
 @mcp.tool()

@@ -108,7 +108,10 @@ Agent 的记忆，游戏差异都保存在会话 profile 中。
    `configure_game_layout` 写入 `dialogue_region`、可选的 `speaker_region` 和
    `choice_region`。姓名/对白符号通过 profile 的 marker 数组提供，不要把某个
    游戏的括号写进代码；看不清符号时宁可暂时留空，让通用解析保留
-   `unparsed_lines` 和 `noise_flags`。
+   `unparsed_lines` 和 `noise_flags`。如果暂时没有可靠的 `choice_region`，
+   `play_until_choice` 在对白框空白或连续不变后会做一次受保护的完整窗口选项探测：
+   仅把对白框上方至少两行纵向对齐的文字作为候选，并停下交给 Codex；普通对白
+   OCR 不启用这条推断路径。
 6. **配置游戏动作和等待策略。** 用 `configure_game_actions` 描述本游戏的
    `next_line`、`hide_ui`、`return_game` 等动作；用下面的
    `configure_game_timing` 选择固定等待或文本稳定等待。动作名称只是会话数据，
@@ -380,6 +383,20 @@ dismiss_choice(choice_id="choice_...", reason="false_positive_visual_review")
 这会记录“误报已驳回”，不会伪造一个路线选择，也会解除该候选对压缩前缀的保护。
 
 `play_until_choice` 在 `compaction_due` 时故意不返回整批原始对白，以减少 Codex token 消耗；原始事件仍保存在本地 `events.jsonl`。响应会返回 `batch_omitted_for_compaction.next_tool=get_compaction_request`、候选状态和阻塞原因。Codex 应调用 `get_compaction_request` 取得带 SHA-256 校验的有界事件段，写入 `save_compaction` 后再继续游玩。如果压缩阈值恰好与最后一帧的 `ocr_uncertain`、`unknown_text` 或 `ocr_unavailable` 同时出现，顶层 `stop_reason` 仍保持 `compaction_due`，但 `stop_conditions` 会列出全部原因，`final_frame_safety` 会明确提示需要视觉复核；这样既不把原始批量文本重新发给 Codex，也不会掩盖最后一帧的安全问题。
+
+### 语义大检查点与多路线记录
+
+普通 `save_compaction` 段落是不可覆盖的底层剧情记录；它们保留来源序号和摘要，便于之后回查。真实游戏选项、路线汇合点和结局是更高一级的语义检查点边界。Codex 可以在已有段落摘要和当前增量的基础上调用 `save_story_checkpoint` 保存大检查点。该接口只新增 `checkpoints/` 下的省流索引，不删除或覆盖已有 `compactions/` 段落。
+
+第一次真实选项出现时，建议建立一个包含此前共通剧情的大检查点，并在选择前保存：
+
+- 从开头到选项前的时间线、人物、关系、任务、设定和未解决伏笔；
+- 选项原文、全部候选项、选项出现时的剧情状态；
+- `choice_node_id`、`route_id`、`parent_checkpoint_id` 等路线标识。
+
+选择后，再以同一个 `choice_node_id` 保存所选路线的分支增量，包括直接后果、延迟后果、独有事件和与其他路线重新汇合的位置。`player_choice` 必须与剧情人物的 `narrative_decision` 分开；不能把“角色决定做某事”记录成玩家选择。重新游玩其他选项时，应从同一个父检查点建立新 `route_id`，不能覆盖原路线。
+
+检查点摘要至少要区分 `confirmed_fact`、`inference`、`ocr_uncertain` 和 `loss_note`。只有在来源段落覆盖范围、所有选项、人物首次出现、重要设定、伏笔和不确定性都已核对后，才可以清理对应原始事件。上下文接口会优先提供最新语义检查点以及其之后的新增段落；旧段落仍留在本地用于审计和恢复。
 
 ## 许可证
 

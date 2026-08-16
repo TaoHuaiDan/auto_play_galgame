@@ -297,6 +297,67 @@ class SessionStoreTests(unittest.TestCase):
             )
             self.assertEqual(len(reloaded_context["compacted_summaries"]), 1)
 
+    def test_compaction_contract_describes_route_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SessionStore(
+                Path(temporary),
+                compaction_threshold_bytes=16_384,
+                compaction_keep_recent_events=4,
+            )
+            store.create_session("路线压缩测试", session_id="checkpoint-contract")
+            for index in range(8):
+                store.record_dialogue(
+                    f"选项前的共通剧情 {index} " + ("重要设定信息。" * 220),
+                    speaker="旁白",
+                    session_id="checkpoint-contract",
+                )
+            request = store.get_compaction_request(
+                max_source_chars=20_000,
+                session_id="checkpoint-contract",
+            )
+            contract = request["request"]["summary_contract"]
+            self.assertIn("checkpoint_contract", contract)
+            self.assertIn("真实游戏选项是大检查点边界：先记录选项出现前的状态和全部候选项，再记录选择后的分支增量", contract["rules"])
+            self.assertIn("choice_boundary", contract["checkpoint_contract"]["checkpoint_kinds"])
+
+    def test_story_checkpoint_is_durable_and_reduces_compact_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SessionStore(root)
+            store.create_session("检查点测试", session_id="checkpoint-session")
+            for index in range(3):
+                store.record_dialogue(f"第 {index} 段剧情", speaker="角色A", session_id="checkpoint-session")
+            segment = store.get_session("checkpoint-session")
+            checkpoint = store.save_story_checkpoint(
+                {
+                    "checkpoint_kind": "initial_common",
+                    "route_id": "main",
+                    "coverage": {"seq_start": 1, "seq_end": segment["timeline"][-1]["seq"]},
+                    "source_segments": [],
+                    "story_summary": "共通线已经记录到当前剧情。",
+                    "confirmed_facts": ["角色A出现"],
+                    "player_choices": [],
+                },
+                session_id="checkpoint-session",
+            )
+            self.assertTrue(Path(checkpoint["path"]).exists())
+            context = store.build_context(
+                session_id="checkpoint-session",
+                include_markdown=False,
+                compact=True,
+            )
+            self.assertEqual(len(context["story_checkpoints"]), 1)
+            self.assertEqual(context["compacted_summaries"], [])
+            self.assertEqual(context["session"]["compaction"]["checkpoint_count"], 1)
+
+            reloaded = SessionStore(root)
+            reloaded_context = reloaded.build_context(
+                session_id="checkpoint-session",
+                include_markdown=False,
+                compact=True,
+            )
+            self.assertEqual(reloaded_context["story_checkpoints"][0]["checkpoint"]["story_summary"], "共通线已经记录到当前剧情。")
+
     def test_event_journal_keeps_checkpoint_small_and_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

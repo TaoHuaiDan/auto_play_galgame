@@ -116,6 +116,43 @@ class TextParserTests(unittest.TestCase):
         self.assertNotIn("说实话", parsed["dialogue"])
         self.assertNotIn("敷衍过去", parsed["dialogue"])
 
+    def test_choice_probe_infers_unprefixed_rows_without_choice_region(self) -> None:
+        profile = {
+            **SPATIAL_PROFILE,
+            "choice_layout": "vertical",
+            "_choice_probe": True,
+        }
+        regions = [
+            {"text": "说实话", "x": 390, "y": 300, "width": 160, "height": 40},
+            {"text": "敷衍过去", "x": 380, "y": 430, "width": 180, "height": 40},
+        ]
+
+        parsed = parse_screen_text(
+            "说实话\n敷衍过去",
+            regions=regions,
+            image_size=(1000, 800),
+            layout_profile=profile,
+        )
+
+        self.assertEqual(parsed["choices"], ["说实话", "敷衍过去"])
+        self.assertEqual(parsed["dialogue"], "")
+
+    def test_unprefixed_rows_are_not_choices_without_guarded_probe(self) -> None:
+        regions = [
+            {"text": "说实话", "x": 390, "y": 300, "width": 160, "height": 40},
+            {"text": "敷衍过去", "x": 380, "y": 430, "width": 180, "height": 40},
+        ]
+
+        parsed = parse_screen_text(
+            "说实话\n敷衍过去",
+            regions=regions,
+            image_size=(1000, 800),
+            layout_profile=SPATIAL_PROFILE,
+        )
+
+        self.assertEqual(parsed["choices"], [])
+        self.assertEqual(parsed["text_status"], "unknown")
+
     def test_choice_profile_excludes_prefixed_top_banner(self) -> None:
         parsed = parse_screen_text(
             "- cHAPTER 1 · 1",

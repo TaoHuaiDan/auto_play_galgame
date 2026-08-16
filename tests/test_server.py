@@ -1258,6 +1258,7 @@ class BatchPlayTests(unittest.TestCase):
 
         self.assertIs(result_payload, payload)
         self.assertEqual(result_path, path)
+        self.assertTrue(payload["_choice_probe"])
         process.assert_called_once()
 
     def test_choice_click_point_uses_profile_and_ocr_geometry(self) -> None:

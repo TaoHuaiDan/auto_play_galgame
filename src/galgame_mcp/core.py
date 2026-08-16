@@ -1166,6 +1166,8 @@ class SessionStore:
         meta.setdefault("keep_recent_events", self.compaction_keep_recent_events)
         meta.setdefault("compacted_through_seq", 0)
         meta.setdefault("segments", [])
+        meta.setdefault("checkpoints", [])
+        meta.setdefault("active_checkpoint_id", None)
         meta.setdefault("pending", None)
         try:
             next_seq = int(meta.get("next_seq", 0))
@@ -1178,6 +1180,8 @@ class SessionStore:
         meta["next_seq"] = max(next_seq, max_seq + 1, 1)
         if not isinstance(meta.get("segments"), list):
             meta["segments"] = []
+        if not isinstance(meta.get("checkpoints"), list):
+            meta["checkpoints"] = []
         return meta
 
     @staticmethod
@@ -1458,7 +1462,48 @@ class SessionStore:
                     "完整记录每个选项、实际选择和选择后的结果；无法判断的内容写入 loss_notes 或 ocr_uncertainties",
                     "保留未解决伏笔、路线变量、重要原文短句和当前状态",
                     "只总结 source 中的内容，不凭空补写剧情",
+                    "普通段落摘要是不可覆盖的底层记录；不要为了生成总纲而删除其中独有事实",
+                    "真实游戏选项是大检查点边界：先记录选项出现前的状态和全部候选项，再记录选择后的分支增量",
+                    "必须把 player_choice 与 narrative_decision 分开；剧情人物的决定不能伪装成玩家路线选择",
+                    "多路线使用 route_id、parent_checkpoint_id 和 choice_node_id；共通剧情只去重一次，分支独有剧情必须保留",
+                    "第一次大检查点可以综合已有全部段落；后续检查点只需合并上一个检查点与新增段落，不要反复重写全部历史",
+                    "只有在覆盖范围、选项记录、人物首次出现、关键设定、未解决伏笔和不确定性均已核对后，才允许清理对应原始事件",
                 ],
+                "checkpoint_contract": {
+                    "purpose": "在真实选项、路线汇合或结局处建立可回查的大检查点，供 Codex 理解共通线、分支和延迟后果",
+                    "recommended_fields": [
+                        "checkpoint_kind",
+                        "checkpoint_id",
+                        "parent_checkpoint_id",
+                        "route_id",
+                        "choice_node_id",
+                        "source_segments",
+                        "coverage",
+                        "timeline",
+                        "confirmed_facts",
+                        "characters",
+                        "relationships",
+                        "player_choices",
+                        "branch_deltas",
+                        "open_threads",
+                        "important_quotes",
+                        "current_state",
+                        "uncertainties",
+                        "loss_notes",
+                    ],
+                    "checkpoint_kinds": [
+                        "initial_common",
+                        "choice_boundary",
+                        "route_progress",
+                        "route_ending",
+                    ],
+                    "choice_boundary_rules": [
+                        "保存选择前剧情和状态，并完整保存所有可见选项文本",
+                        "选择动作后，以同一个 choice_node_id 建立所选 route_id 的后续增量",
+                        "记录直接后果和后来才确认的延迟后果；无法证明的因果关系标为待验证",
+                        "重新游玩其他选项时，从同一 parent_checkpoint_id 创建新分支，不覆盖原路线",
+                    ],
+                },
             },
         }
 
@@ -1590,6 +1635,165 @@ class SessionStore:
                     "summary": copy.deepcopy(payload["summary"]),
                 })
         return summaries
+
+    def _load_story_checkpoints_locked(self, session: dict[str, Any]) -> list[dict[str, Any]]:
+        """Load durable route checkpoints without treating them as raw events."""
+
+        checkpoints: list[dict[str, Any]] = []
+        session_directory = self.session_dir(session["session_id"]).resolve()
+        for checkpoint_meta in self._compaction_meta_locked(session).get("checkpoints") or []:
+            if not isinstance(checkpoint_meta, dict):
+                continue
+            filename = checkpoint_meta.get("filename")
+            if not filename:
+                continue
+            path = (session_directory / str(filename)).resolve()
+            try:
+                path.relative_to(session_directory)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                checkpoints.append({
+                    "checkpoint_id": checkpoint_meta.get("checkpoint_id"),
+                    "status": "missing_or_invalid",
+                    "source": copy.deepcopy(checkpoint_meta.get("source") or {}),
+                })
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("checkpoint"), dict):
+                checkpoints.append({
+                    "checkpoint_id": payload.get("checkpoint_id"),
+                    "source": copy.deepcopy(payload.get("source") or {}),
+                    "checkpoint": copy.deepcopy(payload["checkpoint"]),
+                })
+        return checkpoints
+
+    @staticmethod
+    def _normalise_story_checkpoint(checkpoint: Any) -> dict[str, Any]:
+        if not isinstance(checkpoint, dict):
+            raise SessionError("checkpoint 必须是 JSON 对象")
+        try:
+            normalised = copy.deepcopy(checkpoint)
+            encoded = json.dumps(normalised, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise SessionError("checkpoint 必须只包含 JSON 可序列化值") from exc
+        if len(encoded.encode("utf-8")) > 4_000_000:
+            raise SessionError("checkpoint 过大，不能超过 4 MB")
+        story_summary = _clean_text(normalised.get("story_summary"))
+        if not story_summary:
+            raise SessionError("checkpoint 必须包含非空 story_summary")
+        normalised["story_summary"] = story_summary
+        normalised["checkpoint_kind"] = _clean_text(normalised.get("checkpoint_kind")) or "route_progress"
+        normalised["route_id"] = _clean_text(normalised.get("route_id")) or "main"
+        list_fields = (
+            "source_segments",
+            "timeline",
+            "confirmed_facts",
+            "characters",
+            "relationships",
+            "player_choices",
+            "branch_deltas",
+            "open_threads",
+            "important_quotes",
+            "uncertainties",
+            "loss_notes",
+        )
+        for key in list_fields:
+            value = normalised.get(key)
+            if value is None:
+                normalised[key] = []
+            elif not isinstance(value, list):
+                raise SessionError(f"checkpoint.{key} 必须是数组")
+            elif len(value) > 20_000:
+                raise SessionError(f"checkpoint.{key} 不能超过 20000 项")
+        for key in ("coverage", "current_state", "variables"):
+            value = normalised.get(key)
+            if value is None:
+                normalised[key] = {}
+            elif not isinstance(value, dict):
+                raise SessionError(f"checkpoint.{key} 必须是对象")
+        return normalised
+
+    def save_story_checkpoint(
+        self,
+        checkpoint: dict[str, Any],
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a semantic route checkpoint while retaining segment audit records."""
+
+        normalised = self._normalise_story_checkpoint(checkpoint)
+        with self._lock:
+            session = self._require_locked(session_id)
+            meta = self._compaction_meta_locked(session)
+            existing_ids = {
+                str(item.get("checkpoint_id"))
+                for item in meta.get("checkpoints") or []
+                if isinstance(item, dict) and item.get("checkpoint_id")
+            }
+            requested_id = _clean_text(normalised.get("checkpoint_id"))
+            if requested_id:
+                if not _SESSION_ID_RE.fullmatch(requested_id):
+                    raise SessionError("checkpoint_id 只能包含字母、数字、下划线和连字符")
+                checkpoint_id = requested_id
+            else:
+                checkpoint_id = f"checkpoint_{len(existing_ids) + 1:04d}"
+            if checkpoint_id in existing_ids:
+                raise SessionError(f"checkpoint_id 已存在: {checkpoint_id}")
+            normalised["checkpoint_id"] = checkpoint_id
+            normalised["session_id"] = session["session_id"]
+            normalised["created_at"] = utc_now()
+
+            coverage = normalised.get("coverage") or {}
+            source_seq_start = coverage.get("seq_start")
+            source_seq_end = coverage.get("seq_end")
+            source_segments = normalised.get("source_segments") or []
+            filename = Path("checkpoints") / f"{checkpoint_id}.json"
+            session_directory = self.session_dir(session["session_id"]).resolve()
+            destination = (session_directory / filename).resolve()
+            try:
+                destination.relative_to(session_directory)
+            except ValueError as exc:
+                raise SessionError("checkpoint 文件路径无效") from exc
+            payload = {
+                "record_type": "galgame_story_checkpoint",
+                "schema_version": "1.0",
+                "checkpoint_id": checkpoint_id,
+                "session_id": session["session_id"],
+                "created_at": normalised["created_at"],
+                "source": {
+                    "seq_start": source_seq_start,
+                    "seq_end": source_seq_end,
+                    "segment_count": len(source_segments),
+                    "segment_ids": [
+                        item.get("segment_id") if isinstance(item, dict) else str(item)
+                        for item in source_segments
+                    ],
+                },
+                "checkpoint": normalised,
+            }
+            encoded = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_suffix(destination.suffix + ".tmp")
+            temporary.write_text(encoded, encoding="utf-8")
+            json.loads(temporary.read_text(encoding="utf-8"))
+            temporary.replace(destination)
+            checkpoint_meta = {
+                "checkpoint_id": checkpoint_id,
+                "filename": str(filename).replace("\\", "/"),
+                "checkpoint_kind": normalised["checkpoint_kind"],
+                "route_id": normalised["route_id"],
+                "source": copy.deepcopy(payload["source"]),
+                "story_summary": normalised["story_summary"],
+                "created_at": normalised["created_at"],
+            }
+            meta["checkpoints"] = list(meta.get("checkpoints") or []) + [checkpoint_meta]
+            meta["active_checkpoint_id"] = checkpoint_id
+            self._save_locked(session)
+            return {
+                "session_id": session["session_id"],
+                "checkpoint": checkpoint_meta,
+                "payload": copy.deepcopy(normalised),
+                "path": str(destination),
+                "retained_segment_count": len(meta.get("segments") or []),
+            }
 
     # ---------- event recording ----------
 
@@ -2086,6 +2290,24 @@ class SessionStore:
                     if event.get("type") == "note"
                 ][-limit:]
                 current_state = copy.deepcopy(session["current_state"])
+            compacted_summaries = self._load_compaction_summaries_locked(session)
+            story_checkpoints = self._load_story_checkpoints_locked(session)
+            if compact and story_checkpoints:
+                latest_checkpoint = story_checkpoints[-1]
+                latest_source = latest_checkpoint.get("source") or {}
+                try:
+                    checkpoint_end = int(latest_source.get("seq_end") or 0)
+                except (TypeError, ValueError):
+                    checkpoint_end = 0
+                if checkpoint_end:
+                    # Keep all segment files on disk for audit/recovery, but the
+                    # normal compact context only needs the delta after the
+                    # latest semantic checkpoint.
+                    compacted_summaries = [
+                        item
+                        for item in compacted_summaries
+                        if int((item.get("source") or {}).get("seq_end") or 0) > checkpoint_end
+                    ]
             context: dict[str, Any] = {
                 "schema_version": SCHEMA_VERSION,
                 "session": self._summary(session),
@@ -2097,7 +2319,8 @@ class SessionStore:
                 # Historical raw events may have been purged after Codex
                 # returned a validated summary.  These files are the durable
                 # long-term memory that must be combined with the raw tail.
-                "compacted_summaries": self._load_compaction_summaries_locked(session),
+                "compacted_summaries": compacted_summaries,
+                "story_checkpoints": story_checkpoints,
                 "compaction": self._compaction_status_locked(session),
             }
             if include_markdown:
@@ -2234,6 +2457,8 @@ class SessionStore:
             "compaction": {
                 "compacted_through_seq": int(compaction.get("compacted_through_seq") or 0),
                 "segment_count": len(compaction.get("segments") or []) if isinstance(compaction.get("segments"), list) else 0,
+                "checkpoint_count": len(compaction.get("checkpoints") or []) if isinstance(compaction.get("checkpoints"), list) else 0,
+                "active_checkpoint_id": compaction.get("active_checkpoint_id"),
             },
         }
 

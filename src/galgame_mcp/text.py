@@ -889,8 +889,28 @@ def _layout_choice_keys(
     ):
         return set()
     choice_bounds = _profile_region_bounds(layout_profile, "choice_region", image_size)
+    inferred_probe = False
     if choice_bounds is None:
-        return set()
+        # A full-window choice probe is deliberately narrower than normal OCR:
+        # it is only enabled after the dialogue crop has gone blank or stayed
+        # unchanged. Some VN profiles do not know the choice box yet, but
+        # their dialogue box still gives us a safe upper boundary. In that
+        # probe-only mode, infer a broad area above the dialogue box and let
+        # the aligned-row test below identify visual buttons. The result is
+        # still a blocking choice candidate; it never triggers an automatic
+        # click by itself.
+        if not bool(layout_profile.get("_choice_probe")):
+            return set()
+        dialogue_bounds = _profile_region_bounds(layout_profile, "dialogue_region", image_size)
+        if dialogue_bounds is None:
+            return set()
+        _, dialogue_top, _, _ = dialogue_bounds
+        probe_top = image_height * 0.10
+        probe_bottom = min(image_height * 0.88, dialogue_top - max(8.0, image_height * 0.02))
+        if probe_bottom <= probe_top:
+            return set()
+        choice_bounds = (0.0, probe_top, float(image_width), probe_bottom - probe_top)
+        inferred_probe = True
     minimum_count = _choice_min_count(layout_profile)
     choice_layout = str(layout_profile.get("choice_layout") or "vertical").strip().casefold()
     if choice_layout not in {"vertical", "horizontal", "both"}:
@@ -921,6 +941,12 @@ def _layout_choice_keys(
         center_x = x + width / 2
         center_y = y + height / 2
         if not _point_in_bounds((center_x, center_y), choice_bounds):
+            continue
+        if inferred_probe and _ocr_ignore_region_match(
+            region,
+            image_size=image_size,
+            layout_profile=layout_profile,
+        ):
             continue
         try:
             minimum_height_ratio = max(0.0, min(float(layout_profile.get("choice_min_height_ratio", 0.015)), 1.0))
