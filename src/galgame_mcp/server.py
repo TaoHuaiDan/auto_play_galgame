@@ -326,6 +326,30 @@ def _mark_ocr_uncertain(
         evidence["ocr_uncertain"] = copy.deepcopy(marker)
 
 
+def _final_frame_safety_reason(payload: dict[str, Any] | None) -> str | None:
+    """Expose a safety stop that coexists with a higher-level batch stop.
+
+    A play loop can reach the compaction threshold immediately after a click
+    whose final capture is still an OCR-uncertain transition frame.  The
+    compaction reason remains the primary stop (so raw data is not returned),
+    but callers must still see that the final frame needs visual review.
+    """
+
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("ocr_uncertain"):
+        return "ocr_uncertain"
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, dict):
+        return None
+    blocking = set(str(item) for item in (evidence.get("blocking_reasons") or []))
+    if "unknown_text" in blocking:
+        return "unknown_text_detected"
+    if "ocr_unavailable" in blocking:
+        return "ocr_unavailable"
+    return None
+
+
 mcp = FastMCP(
     name="galgame-mcp",
     instructions=(
@@ -353,6 +377,8 @@ mcp = FastMCP(
         "需要连续无人值守推进时使用 play_until_choice；默认不设步数或 batch 字符上限，"
         "它在本地循环 OCR、记录对白并推进，直到出现游戏选项、OCR/输入安全错误或 compaction_due，"
         "期间不会逐帧把结果发给 Codex。max_steps/max_batch_chars 仅适合显式冒烟测试。"
+        "若压缩阈值与最后一帧的 OCR 安全问题同时出现，stop_reason 仍为 compaction_due 以便先做本地压缩，"
+        "同时用 stop_conditions 和 final_frame_safety 保留需要 Codex 视觉复核的信息。"
         "不同游戏的命名输入通过 configure_game_actions 配置，再用 perform_game_action 执行；动作只允许 click/key/scroll/hold/wait/focus 等安全类型，不能执行任意代码。"
         "当 get_codex_context 返回 compaction.summary_due=true 时，调用 get_compaction_request 取得一个有界原始事件段，"
         "由 Codex 按 summary_contract 生成详细结构化总结，再调用 save_compaction；只有校验通过后 MCP 才会清除对应的原始事件，"
@@ -4028,6 +4054,10 @@ def play_until_choice(
                 public_final[key] = final_payload[key]
         if include_raw_text and final_payload.get("raw_text"):
             public_final["raw_text"] = final_payload["raw_text"]
+    final_frame_safety_reason = _final_frame_safety_reason(final_payload)
+    stop_conditions = [stop_reason]
+    if final_frame_safety_reason and final_frame_safety_reason not in stop_conditions:
+        stop_conditions.append(final_frame_safety_reason)
     response_batch = batch
     if stop_reason == "compaction_due":
         # The raw source is already available through get_compaction_request;
@@ -4045,7 +4075,25 @@ def play_until_choice(
         "final": public_final,
         "last_action": last_action,
         "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+        "stop_conditions": stop_conditions,
     }
+    if final_frame_safety_reason:
+        final_evidence = public_final.get("evidence")
+        response["final_frame_safety"] = {
+            "reason": final_frame_safety_reason,
+            "blocking_reasons": list(
+                (final_evidence or {}).get("blocking_reasons") or []
+            )
+            if isinstance(final_evidence, dict)
+            else [],
+            "manual_review_required": final_frame_safety_reason
+            in {
+                "ocr_uncertain",
+                "ocr_unavailable",
+                "unknown_text_detected",
+                "dialogue_not_detected",
+            },
+        }
     compaction_status = _play_compaction_status(session["session_id"])
     if compaction_status is not None:
         response["compaction"] = compaction_status
@@ -4111,7 +4159,19 @@ def play_until_choice(
     # an unusual frame that Windows OCR cannot read.  This is deliberately a
     # stop-and-inspect fallback rather than a second OCR backend or another
     # blind input attempt.
-    manual_intervention = stop_reason in {
+    intervention_reason = (
+        stop_reason
+        if stop_reason
+        in {
+            "dialogue_not_detected",
+            "ocr_uncertain",
+            "ocr_unavailable",
+            "timing_settle_timeout",
+            "unknown_text_detected",
+        }
+        else final_frame_safety_reason
+    )
+    manual_intervention = intervention_reason in {
         "dialogue_not_detected",
         "ocr_uncertain",
         "ocr_unavailable",
@@ -4123,12 +4183,12 @@ def play_until_choice(
             "required": True,
             "reason": (
                 "timing_settle_timeout"
-                if stop_reason == "timing_settle_timeout"
+                if intervention_reason == "timing_settle_timeout"
                 else (
                     "unknown_text_detected"
-                    if stop_reason == "unknown_text_detected"
+                    if intervention_reason == "unknown_text_detected"
                     else "ocr_uncertain"
-                    if stop_reason == "ocr_uncertain"
+                    if intervention_reason == "ocr_uncertain"
                     else "ocr_frame_empty"
                 )
             ),

@@ -17,6 +17,7 @@ from galgame_mcp.server import (
     _compare_bottom_text,
     _filter_ocr_result_to_region,
     _fast_capture_has_text,
+    _final_frame_safety_reason,
     _layout_profile_for_capture,
     _process_local_text,
     _choice_click_point_from_payload,
@@ -159,6 +160,21 @@ class TimingProfileTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "compaction_due")
         self.assertEqual(result["steps_advanced"], 0)
         self.assertTrue(result["compaction"]["summary_due"])
+
+    def test_final_frame_safety_reason_is_exposed_separately_from_compaction(self) -> None:
+        payload = {
+            "ocr_uncertain": {"required": True},
+            "evidence": {
+                "safe_to_advance": False,
+                "blocking_reasons": ["ocr_uncertain", "dialogue_unresolved"],
+            },
+        }
+        self.assertEqual(_final_frame_safety_reason(payload), "ocr_uncertain")
+        self.assertIsNone(
+            _final_frame_safety_reason(
+                {"evidence": {"blocking_reasons": ["dialogue_unresolved"]}}
+            )
+        )
 
     def test_wait_for_text_hash_stable_requires_change_and_repeated_hash(self) -> None:
         first_payload, first_path = self._frame("旧台词", "C:/old.png")

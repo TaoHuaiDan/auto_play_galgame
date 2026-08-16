@@ -379,7 +379,7 @@ dismiss_choice(choice_id="choice_...", reason="false_positive_visual_review")
 
 这会记录“误报已驳回”，不会伪造一个路线选择，也会解除该候选对压缩前缀的保护。
 
-`play_until_choice` 在 `compaction_due` 时故意不返回整批原始对白，以减少 Codex token 消耗；原始事件仍保存在本地 `events.jsonl`。响应会返回 `batch_omitted_for_compaction.next_tool=get_compaction_request`、候选状态和阻塞原因。Codex 应调用 `get_compaction_request` 取得带 SHA-256 校验的有界事件段，写入 `save_compaction` 后再继续游玩。
+`play_until_choice` 在 `compaction_due` 时故意不返回整批原始对白，以减少 Codex token 消耗；原始事件仍保存在本地 `events.jsonl`。响应会返回 `batch_omitted_for_compaction.next_tool=get_compaction_request`、候选状态和阻塞原因。Codex 应调用 `get_compaction_request` 取得带 SHA-256 校验的有界事件段，写入 `save_compaction` 后再继续游玩。如果压缩阈值恰好与最后一帧的 `ocr_uncertain`、`unknown_text` 或 `ocr_unavailable` 同时出现，顶层 `stop_reason` 仍保持 `compaction_due`，但 `stop_conditions` 会列出全部原因，`final_frame_safety` 会明确提示需要视觉复核；这样既不把原始批量文本重新发给 Codex，也不会掩盖最后一帧的安全问题。
 
 ## 许可证
 
