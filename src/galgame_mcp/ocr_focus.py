@@ -161,6 +161,7 @@ def map_zoomed_ocr_result(
                     "width": float(variant.get("source_width") or 0.0),
                     "height": float(variant.get("source_height") or 0.0),
                     "synthetic": True,
+                    "geometry_reliable": True,
                     "source": "focus_region",
                     "label": str(variant.get("label") or ""),
                 }

@@ -106,6 +106,30 @@ class PlatformBufferTests(unittest.TestCase):
         self.assertEqual(result["regions"][0]["x"], 4.0)
         self.assertEqual(result["regions"][0]["width"], 100.0)
 
+    def test_rapidocr_missing_bbox_marks_full_window_geometry_unreliable(self) -> None:
+        class FakeRapidResult:
+            txts = ("unknown",)
+            boxes = ()
+            scores = (0.8,)
+            elapse = 0.012
+
+        class FakeEngine:
+            def __call__(self, _path: str) -> FakeRapidResult:
+                return FakeRapidResult()
+
+        with tempfile.NamedTemporaryFile(suffix=".png") as image, patch.object(
+            platform_module, "_RAPIDOCR_ENGINE", FakeEngine()
+        ), patch.object(platform_module, "_RAPIDOCR_INIT_ERROR", None), patch.object(
+            platform_module, "_rapidocr_png_size", return_value=(100, 100)
+        ):
+            result = rapidocr_image(image.name)
+
+        self.assertTrue(result["execution_success"])
+        self.assertTrue(result["usable"])
+        self.assertTrue(result["regions"][0]["synthetic"])
+        self.assertFalse(result["regions"][0]["geometry_reliable"])
+        self.assertEqual(result["regions"][0]["source"], "rapidocr_full_image")
+
     def test_windows_ocr_preloads_onnx_runtime_before_first_request(self) -> None:
         order: list[str] = []
 

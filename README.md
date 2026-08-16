@@ -240,7 +240,7 @@ record_parsed_text(raw_text="...", screenshot_path="...")
 
 如果不希望游戏抢到前台，可使用 `background_press_key`、`background_click`、`background_scroll`；`advance_game`、`play_until_choice` 和 `select_choice` 默认使用后台窗口消息，需要前台输入时显式传 `background=false`。底层 `background_*` 接口默认用 `delivery="post"` 通过 `PostMessageW` 排队；高层自动游玩工具的后台输入默认用 `background_input_method="send"`，通过带超时的 `SendMessageTimeoutW` 直接调用窗口过程，实测对本游戏更可靠。两种方式都不调用 `SetForegroundWindow`、不移动真实鼠标；`queued=true`/`delivered=true` 只代表系统层结果，不代表游戏一定执行了动作。只读 Win32 消息的引擎适合这几条路径；Raw Input、DirectInput、部分 Unity/独占渲染输入路径可能忽略它们，此时应显式回退到前台 `SendInput` 或游戏专用适配器。窗口消息点击和滚轮的坐标使用屏幕坐标，MCP 会在本地转换鼠标移动消息的客户区坐标。`click_screen(input_method="touch")` 还提供显式 Windows 触摸注入备用路径。后台模式下设置页恢复也使用窗口消息点击；如果未找到明确“回到游戏/返回游戏”按钮，仍不会猜测输入。
 
-完整窗口 OCR 先正常使用 Windows OCR。已配置 `dialogue_region` 的游戏会先走快速对白区域；快速区域为空、只有人物名或只有 VOICE/AUTO 等界面残留时，MCP 会捕获完整窗口并再次使用 Windows OCR。只有完整窗口 Windows OCR 仍没有可用剧情文本时，才会在同一张完整窗口截图上调用可选的 RapidOCR PP-OCRv6-small ONNX 后端。RapidOCR 只作为识别失败保底，不参与快速区域的正常路径，也不再执行旧的 2 倍 focused OCR。两个后端共用同一套 `layout_profile`、空间分类和文本解析规则；执行状态、可用性、解析是否足以作为剧情文本和耗时会记录在 `ocr_backends`。RapidOCR 成功且解析出对白/选项时才替换当前结果。RapidOCR 识别出正常对白后，若剩余未知框全部位于已知对白/姓名/选项区域之外，则这些未知内容只记录为 `unknown_lines`，不会单独触发安全停机；未知框位于剧情区域内、没有可靠坐标，或 Windows OCR 路径出现同类未知时仍按保守策略阻断。仍无法确认时，MCP 会保存并返回截图，标记 `ocr_uncertain`，由 Codex 进行一次视觉复核，自动游玩在此处停止。不会做全屏候选搜索、对比度增强或多轮重试。
+完整窗口 OCR 先正常使用 Windows OCR。已配置 `dialogue_region` 的游戏会先走快速对白区域；快速区域为空、只有人物名或只有 VOICE/AUTO 等界面残留时，MCP 会捕获完整窗口并再次使用 Windows OCR。只有完整窗口 Windows OCR 仍没有可用剧情文本时，才会在同一张完整窗口截图上调用可选的 RapidOCR PP-OCRv6-small ONNX 后端。RapidOCR 只作为识别失败保底，不参与快速区域的正常路径，也不再执行旧的 2 倍 focused OCR。两个后端共用同一套 `layout_profile`、空间分类和文本解析规则；执行状态、可用性、解析是否足以作为剧情文本和耗时会记录在 `ocr_backends`。RapidOCR 成功且解析出对白/选项时才替换当前结果。RapidOCR 识别出正常对白后，若剩余未知框全部位于已知对白/姓名/选项区域之外，则这些未知内容只记录为 `unknown_lines`，不会单独触发安全停机；未知框位于剧情区域内、没有可靠坐标（包括 RapidOCR 没有词框时生成的整屏 synthetic 框），或 Windows OCR 路径出现同类未知时仍按保守策略阻断。已知裁切范围产生的 focused synthetic 框会保留其明确的裁切空间约束。仍无法确认时，MCP 会保存并返回截图，标记 `ocr_uncertain`，由 Codex 进行一次视觉复核，自动游玩在此处停止。不会做全屏候选搜索、对比度增强或多轮重试。
 
 RapidOCR 是可选后端，不改变现有 Windows OCR 返回结构。安装：
 
@@ -265,12 +265,12 @@ configure_game_layout(profile={
   "choice_layout": "vertical",
   "ocr_ignore_regions": [
     {"name": "window_titlebar", "x": 0, "y": 0, "width": 1, "height": 0.05, "coordinate_space": "normalized"},
-    {"name": "chapter_banner", "x": 0, "y": 0.05, "width": 0.24, "height": 0.16, "coordinate_space": "normalized"},
+    {"name": "fixed_logo", "x": 0.04, "y": 0.06, "width": 0.20, "height": 0.12, "coordinate_space": "normalized"},
     {"name": "fixed_footer", "x": 0, "y": 0.91, "width": 1, "height": 0.09, "coordinate_space": "normalized"}
   ],
   "ocr_blacklist": [
-    {"text": "RIDDLE JOKER", "match": "exact", "region": "window_titlebar", "reason": "固定窗口标题"},
-    {"text": "CHAPTER", "match": "contains", "region": "chapter_banner", "reason": "章节装饰"}
+    {"text": "GAME TITLE", "match": "exact", "region": "window_titlebar", "reason": "固定窗口标题"},
+    {"text": "LOGO", "match": "contains", "region": "fixed_logo", "reason": "固定游戏 Logo"}
   ]
 })
 configure_game_actions(actions={
@@ -289,7 +289,7 @@ observe_game()
 
 `configure_game_actions` 是跨游戏的动作适配层：profile 只描述 `click`、`key`、`scroll`、`hold`、`wait`、`focus` 六类安全动作，不写入游戏标题专用代码。点击可以使用屏幕坐标，也可以使用窗口中心或 `window_normalized` 的 0 到 1 相对坐标；`delivery` 支持 `post` 和 `send`。之后调用 `perform_game_action` 执行命名动作，`parameters` 可以在单次调用中覆盖 profile 的按键、方向、坐标或等待时间。绑定窗口时 click/key/scroll 默认走后台消息，hold/focus/wait 默认保持前台或本地执行；需要改变默认行为时显式传 `background`。`hide_ui`、`return_game` 等名称只是 profile 示例，不会被代码写死，换游戏只需重新配置映射。`advance_game` 等高层工具仍保留，适合默认推进流程。
 
-`ocr_ignore_regions` 和 `ocr_blacklist` 是按游戏配置的 OCR 噪声规则，不是针对某个游戏写死的分支。`ocr_ignore_regions` 中的文字框会从 `speaker`、`dialogue`、`choice` 和 `unknown` 语义解析中排除，适合窗口标题栏、固定 Logo、章节横幅和底部控制条；这些文字仍保留在 `raw_text`，并会出现在 `processed_text.ignored_lines`、`noise_flags` 的 `blacklisted_ocr` 项以及 `evidence.ignored_ocr_lines` 中。区域名可供 `ocr_blacklist.region` 引用；黑名单支持 `exact`、`contains` 和 `regex`，不指定区域时按文本匹配。区域过滤是整框过滤，配置时不要覆盖对白框或选项区，否则可能把真实剧情一起忽略。换游戏时先用一次完整窗口 OCR 观察固定装饰的坐标，再把确认无关的区域加入 profile。
+`ocr_ignore_regions` 和 `ocr_blacklist` 是按游戏配置的 OCR 噪声规则，不是针对某个游戏写死的分支。`ocr_ignore_regions` 中的文字框会从 `speaker`、`dialogue`、`choice` 和 `unknown` 语义解析中排除，适合窗口标题栏、固定 Logo 和底部控制条；这些文字仍保留在 `raw_text`，并会出现在 `processed_text.ignored_lines`、`noise_flags` 的 `blacklisted_ocr` 项以及 `evidence.ignored_ocr_lines` 中。区域名可供 `ocr_blacklist.region` 引用；黑名单支持 `exact`、`contains` 和 `regex`，不指定区域时按文本匹配。区域过滤要求 OCR 框至少 60% 的面积位于配置区域内，整屏 synthetic 框不会被当作可靠区域证据。不要把动态章节标题或可能承载剧情的整块区域加入忽略列表；如果确认只有固定装饰词无关，优先为固定词配置黑名单。换游戏时先用一次完整窗口 OCR 观察固定装饰的坐标，再把确认无关的区域加入 profile。
 
 ### 分段剧情压缩
 

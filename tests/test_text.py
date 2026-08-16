@@ -368,6 +368,78 @@ class TextParserTests(unittest.TestCase):
             {flag["code"] for flag in parsed["noise_flags"]},
         )
 
+    def test_synthetic_full_window_box_is_story_risk(self) -> None:
+        parsed = parse_screen_text(
+            "dialogue\nunknown",
+            regions=[
+                {"text": "dialogue", "x": 200, "y": 580, "width": 180, "height": 30},
+                {
+                    "text": "unknown",
+                    "x": 0,
+                    "y": 0,
+                    "width": 1000,
+                    "height": 800,
+                    "synthetic": True,
+                    "source": "rapidocr_full_image",
+                },
+            ],
+            image_size=(1000, 800),
+            layout_profile=SPATIAL_PROFILE,
+        )
+
+        self.assertEqual(parsed["dialogue"], "dialogue")
+        self.assertEqual(parsed["unknown_lines"], ["unknown"])
+        self.assertEqual(parsed["unknown_story_lines"], ["unknown"])
+
+    def test_unknown_story_uses_rectangle_overlap_not_only_center(self) -> None:
+        parsed = parse_screen_text(
+            "unknown",
+            regions=[
+                # The center is above the dialogue box, but the box overlaps
+                # its upper edge by 40 pixels.
+                {"text": "unknown", "x": 200, "y": 500, "width": 180, "height": 100},
+            ],
+            image_size=(1000, 800),
+            layout_profile=SPATIAL_PROFILE,
+        )
+
+        self.assertEqual(parsed["unknown_lines"], ["unknown"])
+        self.assertEqual(parsed["unknown_story_lines"], ["unknown"])
+
+    def test_ignore_region_requires_most_of_the_ocr_box(self) -> None:
+        profile = {
+            "dialogue_region": {
+                "x": 0.0,
+                "y": 0.0,
+                "width": 1.0,
+                "height": 0.10,
+                "coordinate_space": "normalized",
+            },
+            "ocr_ignore_regions": [
+                {
+                    "name": "fixed_footer",
+                    "x": 0.0,
+                    "y": 0.80,
+                    "width": 1.0,
+                    "height": 0.20,
+                    "coordinate_space": "normalized",
+                }
+            ],
+        }
+        parsed = parse_screen_text(
+            "straddling text",
+            regions=[
+                # Exactly half of the OCR box is inside the footer.  Its
+                # center is inside, so the old center-only rule would ignore it.
+                {"text": "straddling text", "x": 100, "y": 700, "width": 200, "height": 200},
+            ],
+            image_size=(1000, 1000),
+            layout_profile=profile,
+        )
+
+        self.assertEqual(parsed["ignored_lines"], [])
+        self.assertEqual(parsed["unknown_lines"], ["straddling text"])
+
     def test_unknown_story_lines_only_include_unknown_boxes_inside_story_regions(self) -> None:
         inside = "0」RIDDLE」OKER: C Search for RiddIe"
         outside = "Chapter 1"

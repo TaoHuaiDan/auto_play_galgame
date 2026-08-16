@@ -345,7 +345,7 @@ mcp = FastMCP(
         "不做全屏候选搜索、对比度增强或多轮重试。Windows OCR 与 RapidOCR 仍无法确认时会返回"
         "ocr_uncertain、保存截图并请求 Codex 视觉复核，自动游玩会在此处停止，不会盲点。"
         "不同游戏的对白框、姓名框、选项区域和姓名/对白符号通过 configure_game_layout 写入当前会话，解析器不按游戏标题猜测符号。"
-        "ocr_ignore_regions 可按坐标过滤确认无关的标题栏、Logo、章节横幅或底部 UI，ocr_blacklist 可按 exact/contains/regex 过滤固定 OCR 文本；"
+        "ocr_ignore_regions 可按坐标过滤确认无关的标题栏、固定 Logo 或底部 UI，ocr_blacklist 可按 exact/contains/regex 过滤固定 OCR 文本；动态章节标题不要整块忽略；"
         "过滤项仍保留在 raw_text、ignored_lines 和 evidence 中，不能覆盖对白或选项区域。"
         "推进后对白框暂时为空时，advance_game/play_until_choice 会在 transition_wait_seconds 的有界等待窗口内本地重试；默认不会发送额外点击。"
         "只有配置 transition_accelerate=true 且完整窗口连续探测确认画面发生明显转场时，才最多额外点击一次；稳定画面 OCR 为空仍返回 ocr_uncertain。"

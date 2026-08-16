@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -471,6 +472,69 @@ def _region_center(region: dict[str, Any]) -> tuple[float, float] | None:
     return x + width / 2.0, y + height / 2.0
 
 
+def _valid_rectangle(
+    values: tuple[Any, Any, Any, Any] | list[Any],
+) -> tuple[float, float, float, float] | None:
+    """Normalize a rectangle and reject non-finite or empty geometry."""
+
+    try:
+        x, y, width, height = (float(value) for value in values)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (x, y, width, height)):
+        return None
+    if width <= 0.0 or height <= 0.0:
+        return None
+    return x, y, width, height
+
+
+def _reliable_region_rectangle(
+    region: dict[str, Any] | None,
+) -> tuple[float, float, float, float] | None:
+    """Return geometry that is safe to use for spatial OCR decisions.
+
+    A full-window OCR backend may have text but no word box.  Its synthetic
+    full-screen rectangle is useful for diagnostics, but it must not be
+    treated as evidence that the text came from any particular UI region.
+    Synthetic rectangles created from a known configured crop may opt in with
+    ``geometry_reliable=True``; this preserves the old focused-OCR contract.
+    """
+
+    if not isinstance(region, dict):
+        return None
+    if bool(region.get("synthetic")) and not bool(region.get("geometry_reliable")):
+        return None
+    try:
+        values = (
+            region.get("x", 0.0),
+            region.get("y", 0.0),
+            region.get("width", 0.0),
+            region.get("height", 0.0),
+        )
+    except AttributeError:
+        return None
+    return _valid_rectangle(values)
+
+
+def _rectangle_area(rectangle: tuple[float, float, float, float]) -> float:
+    return rectangle[2] * rectangle[3]
+
+
+def _rectangle_intersection_area(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> float:
+    """Return the positive-area overlap between two rectangles."""
+
+    first_left, first_top, first_width, first_height = first
+    second_left, second_top, second_width, second_height = second
+    left = max(first_left, second_left)
+    top = max(first_top, second_top)
+    right = min(first_left + first_width, second_left + second_width)
+    bottom = min(first_top + first_height, second_top + second_height)
+    return max(0.0, right - left) * max(0.0, bottom - top)
+
+
 def _point_in_bounds(point: tuple[float, float], bounds: tuple[float, float, float, float]) -> bool:
     x, y = point
     left, top, width, height = bounds
@@ -517,12 +581,21 @@ def _ocr_ignore_region_match(
     image_size: tuple[int, int] | None,
     layout_profile: dict[str, Any] | None,
 ) -> str | None:
-    """Return the fixed non-story region containing an OCR box, if any."""
+    """Return a fixed non-story region that contains most of an OCR box.
+
+    Ignore rules are intentionally stricter than story-risk rules.  A text
+    box is ignored only when at least 60% of its area is inside the configured
+    fixed region; this prevents a large box straddling a dialogue area from
+    being discarded merely because its center falls in a footer or logo.
+    """
 
     if not isinstance(region, dict) or not image_size or not isinstance(layout_profile, dict):
         return None
-    center = _region_center(region)
-    if center is None:
+    region_rectangle = _reliable_region_rectangle(region)
+    if region_rectangle is None:
+        return None
+    region_area = _rectangle_area(region_rectangle)
+    if region_area <= 0.0:
         return None
     raw_regions = layout_profile.get("ocr_ignore_regions") or []
     if isinstance(raw_regions, dict):
@@ -537,7 +610,11 @@ def _ocr_ignore_region_match(
         if not isinstance(item, dict):
             continue
         bounds = _profile_region_bounds({"_ignore": item}, "_ignore", image_size)
-        if bounds is None or not _point_in_bounds(center, bounds):
+        bounds_rectangle = _valid_rectangle(bounds) if bounds is not None else None
+        if bounds_rectangle is None:
+            continue
+        coverage = _rectangle_intersection_area(region_rectangle, bounds_rectangle) / region_area
+        if coverage < 0.60:
             continue
         return str(item.get("name") or item.get("id") or f"region_{index}")
     return None
@@ -612,12 +689,19 @@ def _unknown_line_in_story_region(
     region = _region_for_line(line, regions)
     if region is None or not image_size:
         return True
-    center = _region_center(region)
-    if center is None:
+    region_rectangle = _reliable_region_rectangle(region)
+    if region_rectangle is None:
+        # A synthetic full-window box carries text but no trustworthy spatial
+        # evidence.  RapidOCR must not use its center point to bypass the
+        # fail-closed unknown-text policy.
         return True
     for key in ("choice_region", "dialogue_region", "speaker_region"):
         bounds = _profile_region_bounds(layout_profile, key, image_size)
-        if bounds is not None and _point_in_bounds(center, bounds):
+        bounds_rectangle = _valid_rectangle(bounds) if bounds is not None else None
+        if bounds_rectangle is not None and _rectangle_intersection_area(
+            region_rectangle,
+            bounds_rectangle,
+        ) > 0.0:
             return True
     return False
 
@@ -667,6 +751,10 @@ def _choice_line_allowed(
         return True
     choice_bounds = _profile_region_bounds(layout_profile, "choice_region", image_size)
     region = _region_for_line(line, regions)
+    if region is not None and _reliable_region_rectangle(region) is None:
+        # A synthetic full-window box cannot prove that a line came from the
+        # choice zone, even if its artificial center happens to land there.
+        return False
     if choice_bounds is None:
         # When a game has a configured dialogue box but no explicit choice
         # box, text inside the dialogue box is dialogue by default.  This is
@@ -705,6 +793,12 @@ def _dialogue_line_allowed(
     it must not silently become dialogue.
     """
 
+    region = _region_for_line(line, regions)
+    if region is not None and _reliable_region_rectangle(region) is None:
+        # Do not promote text with missing/unreliable geometry to dialogue.
+        # Raw-text callers without regions retain the historical permissive
+        # behavior below.
+        return False
     if not isinstance(layout_profile, dict):
         return True
     dialogue_bounds = _profile_region_bounds(layout_profile, "dialogue_region", image_size)
@@ -717,7 +811,6 @@ def _dialogue_line_allowed(
         if choice_bounds is not None and regions:
             return False
         return True
-    region = _region_for_line(line, regions)
     if region is None:
         # A dialogue-only crop is already the configured dialogue box.  For a
         # full frame, missing geometry is ambiguous and should fail closed.
@@ -751,6 +844,8 @@ def _layout_name_label(
     if matched is None:
         return None
     speaker_region = _region_for_line(line, regions)
+    if speaker_region is not None and _reliable_region_rectangle(speaker_region) is None:
+        return None
     speaker_bounds = _profile_region_bounds(layout_profile, "speaker_region", image_size)
     if speaker_bounds is not None and speaker_region is not None:
         center = _region_center(speaker_region)
@@ -799,6 +894,8 @@ def _layout_choice_keys(
     ]
     candidates: list[dict[str, Any]] = []
     for region in regions:
+        if _reliable_region_rectangle(region) is None:
+            continue
         text = _clean_dialogue_spacing(str(region.get("text") or ""), layout_profile)
         compact = _compact_ocr_text(text)
         if not compact or len(compact) > 40:

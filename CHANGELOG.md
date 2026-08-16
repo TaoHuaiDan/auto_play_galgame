@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Hardened RapidOCR spatial safety: full-window synthetic boxes no longer
+  qualify as reliable non-story geometry, unknown story risk uses rectangle
+  overlap, and OCR ignore regions require at least 60% box coverage. Fixed
+  focused-crop synthetic boxes retain their known crop geometry.
 - Changed OCR fallback routing so fast dialogue captures use Windows OCR only;
   an unusable full-window Windows OCR result now triggers one same-frame
   RapidOCR PP-OCRv6-small ONNX fallback, with the old 2x focused pass removed

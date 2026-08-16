@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from galgame_mcp.evidence import TextEpisodeTracker, build_frame_evidence
+from galgame_mcp.text import parse_screen_text
 
 
 class EvidenceTests(unittest.TestCase):
@@ -82,6 +83,38 @@ class EvidenceTests(unittest.TestCase):
             allow_unknown_with_story=True,
         )
 
+        self.assertFalse(evidence["safe_to_advance"])
+        self.assertIn("unknown_text", evidence["blocking_reasons"])
+
+    def test_rapidocr_synthetic_geometry_cannot_bypass_unknown_block(self) -> None:
+        parsed = parse_screen_text(
+            "dialogue\nunknown",
+            regions=[
+                {"text": "dialogue", "x": 200, "y": 580, "width": 180, "height": 30},
+                {
+                    "text": "unknown",
+                    "x": 0,
+                    "y": 0,
+                    "width": 1000,
+                    "height": 800,
+                    "synthetic": True,
+                    "source": "rapidocr_full_image",
+                },
+            ],
+            image_size=(1000, 800),
+            layout_profile={
+                "dialogue_region": {
+                    "x": 0.10,
+                    "y": 0.70,
+                    "width": 0.80,
+                    "height": 0.22,
+                    "coordinate_space": "normalized",
+                }
+            },
+        )
+        evidence = build_frame_evidence(parsed, allow_unknown_with_story=True)
+
+        self.assertEqual(parsed["unknown_story_lines"], ["unknown"])
         self.assertFalse(evidence["safe_to_advance"])
         self.assertIn("unknown_text", evidence["blocking_reasons"])
 

@@ -1674,6 +1674,7 @@ def _rapidocr_regions(result: Any, image_size: tuple[int, int] | None) -> tuple[
                     "width": float(image_size[0]),
                     "height": float(image_size[1]),
                     "synthetic": True,
+                    "geometry_reliable": False,
                     "source": "rapidocr_full_image",
                 }
             )
