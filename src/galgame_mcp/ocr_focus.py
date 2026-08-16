@@ -144,6 +144,27 @@ def map_zoomed_ocr_result(
         except (TypeError, ValueError):
             pass
         mapped_regions.append(translated)
+    # Windows.Media.Ocr can return line text without any word bounding boxes
+    # (this is especially common for very short punctuation-only lines).  The
+    # crop itself is still a trustworthy spatial constraint: it was selected
+    # from the caller's configured layout profile.  Preserve that fact as a
+    # synthetic region instead of forcing the downstream parser to treat the
+    # recovered text as full-window, unclassified OCR.
+    if not mapped_regions:
+        fallback_text = str(result.get("text") or "").strip()
+        if fallback_text:
+            mapped_regions.append(
+                {
+                    "text": fallback_text,
+                    "x": source_x,
+                    "y": source_y,
+                    "width": float(variant.get("source_width") or 0.0),
+                    "height": float(variant.get("source_height") or 0.0),
+                    "synthetic": True,
+                    "source": "focus_region",
+                    "label": str(variant.get("label") or ""),
+                }
+            )
     mapped["regions"] = mapped_regions
     mapped["image_path"] = str(Path(source_path).expanduser().resolve())
     return mapped

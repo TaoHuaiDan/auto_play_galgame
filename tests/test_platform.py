@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import tempfile
 import unittest
 from unittest.mock import call, patch
 
@@ -15,6 +16,7 @@ from galgame_mcp.platform import (
     post_window_click,
     post_window_key,
     post_window_wheel,
+    rapidocr_image,
 )
 
 
@@ -77,6 +79,31 @@ class PlatformBufferTests(unittest.TestCase):
             [call(0x11), call(ord("S")), call(ord("S"), key_up=True), call(0x11, key_up=True)],
         )
         sleep.assert_called_once_with(0.25)
+
+    def test_rapidocr_result_keeps_contract_regions_and_backend_metadata(self) -> None:
+        class FakeRapidResult:
+            txts = ("「……？」",)
+            boxes = [[[4.0, 5.0], [104.0, 5.0], [104.0, 35.0], [4.0, 35.0]]]
+            scores = (0.97,)
+            elapse = 0.012
+
+        class FakeEngine:
+            def __call__(self, _path: str) -> FakeRapidResult:
+                return FakeRapidResult()
+
+        with tempfile.NamedTemporaryFile(suffix=".png") as image, patch.object(
+            platform_module, "_RAPIDOCR_ENGINE", FakeEngine()
+        ), patch.object(platform_module, "_RAPIDOCR_INIT_ERROR", None):
+            result = rapidocr_image(image.name)
+
+        self.assertTrue(result["available"])
+        self.assertTrue(result["execution_success"])
+        self.assertTrue(result["usable"])
+        self.assertEqual(result["backend"], "rapidocr_ppocrv6_small")
+        self.assertEqual(result["model"], "PP-OCRv6-small-ONNX")
+        self.assertEqual(result["text"], "「……？」")
+        self.assertEqual(result["regions"][0]["x"], 4.0)
+        self.assertEqual(result["regions"][0]["width"], 100.0)
 
 
 class BackgroundWindowMessageTests(unittest.TestCase):

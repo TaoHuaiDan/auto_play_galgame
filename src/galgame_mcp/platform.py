@@ -31,6 +31,9 @@ class PlatformAutomationError(RuntimeError):
 _OCR_REQUEST_QUEUE: queue.Queue[tuple[Path, str, int, threading.Event, list[dict[str, Any]]] | None] = queue.Queue()
 _OCR_WORKER_LOCK = threading.Lock()
 _OCR_WORKER_THREAD: threading.Thread | None = None
+_RAPIDOCR_ENGINE_LOCK = threading.Lock()
+_RAPIDOCR_ENGINE: Any | None = None
+_RAPIDOCR_INIT_ERROR: Exception | None = None
 
 
 def _enable_windows_dpi_awareness() -> None:
@@ -1472,6 +1475,21 @@ def _run_windows_ocr(path: Path, language: str, timeout_sec: int) -> dict[str, A
 def ocr_image(image_path: str, language: str = "auto", psm: int = 6, timeout_sec: int = 30) -> dict[str, Any]:
     """Run local OCR, preferring Windows OCR and falling back to Tesseract."""
 
+    started = time.perf_counter()
+
+    def finish(result: dict[str, Any]) -> dict[str, Any]:
+        output = dict(result)
+        output.setdefault(
+            "execution_success",
+            str(output.get("status") or "").casefold() in {"ok", "empty"},
+        )
+        output.setdefault(
+            "usable",
+            bool(str(output.get("text") or "").strip() or output.get("regions")),
+        )
+        output.setdefault("elapsed_ms", round((time.perf_counter() - started) * 1000.0, 3))
+        return output
+
     path = Path(image_path).expanduser().resolve()
     if not path.exists():
         raise PlatformAutomationError(f"找不到图片: {path}")
@@ -1482,7 +1500,7 @@ def ocr_image(image_path: str, language: str = "auto", psm: int = 6, timeout_sec
         windows_result = _run_windows_ocr(path, language=language, timeout_sec=timeout)
         windows_result["image_path"] = str(path)
         if windows_result.get("status") == "ok":
-            return windows_result
+            return finish(windows_result)
         attempts.append(windows_result)
 
     executable = shutil.which("tesseract")
@@ -1519,12 +1537,12 @@ def ocr_image(image_path: str, language: str = "auto", psm: int = 6, timeout_sec
             "image_path": str(path),
         }
         if completed.returncode == 0:
-            return tesseract_result
+            return finish(tesseract_result)
         attempts.append(tesseract_result)
 
     messages = [item.get("message") or item.get("stderr") for item in attempts]
     messages = [str(message) for message in messages if message]
-    return {
+    return finish({
         "available": False,
         "status": "missing_dependency" if not attempts else "error",
         "backend": "local",
@@ -1532,7 +1550,174 @@ def ocr_image(image_path: str, language: str = "auto", psm: int = 6, timeout_sec
         "message": "；".join(messages) or "未找到可用的本地 OCR 后端；可安装项目的 [windows-ocr] extra 或系统 Tesseract。",
         "image_path": str(path),
         "attempts": [{key: value for key, value in item.items() if key != "text"} for item in attempts],
-    }
+    })
+
+
+def _rapidocr_png_size(path: Path) -> tuple[int, int] | None:
+    """Read a PNG size without requiring Pillow in the fallback backend."""
+
+    try:
+        header = path.read_bytes()[:24]
+        if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+            return None
+        return int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
+    except (OSError, ValueError):
+        return None
+
+
+def _rapidocr_engine() -> tuple[Any | None, str | None]:
+    """Load RapidOCR once; model initialization can download/load ONNX files."""
+
+    global _RAPIDOCR_ENGINE, _RAPIDOCR_INIT_ERROR
+    if _RAPIDOCR_ENGINE is not None:
+        return _RAPIDOCR_ENGINE, None
+    if _RAPIDOCR_INIT_ERROR is not None:
+        return None, str(_RAPIDOCR_INIT_ERROR)
+    with _RAPIDOCR_ENGINE_LOCK:
+        if _RAPIDOCR_ENGINE is not None:
+            return _RAPIDOCR_ENGINE, None
+        if _RAPIDOCR_INIT_ERROR is not None:
+            return None, str(_RAPIDOCR_INIT_ERROR)
+        try:
+            from rapidocr import EngineType, RapidOCR
+
+            # rapidocr >= 3.9 defaults to PP-OCRv6 small detection and
+            # recognition.  Set the engine explicitly so this fallback stays
+            # on the local ONNX Runtime CPU path even if RapidOCR's global
+            # defaults change later.
+            _RAPIDOCR_ENGINE = RapidOCR(
+                params={
+                    "Det.engine_type": EngineType.ONNXRUNTIME,
+                    "Cls.engine_type": EngineType.ONNXRUNTIME,
+                    "Rec.engine_type": EngineType.ONNXRUNTIME,
+                }
+            )
+            return _RAPIDOCR_ENGINE, None
+        except Exception as exc:  # includes missing package/model/runtime
+            _RAPIDOCR_INIT_ERROR = exc
+            return None, str(exc)
+
+
+def _rapidocr_regions(result: Any, image_size: tuple[int, int] | None) -> tuple[str, list[dict[str, Any]]]:
+    """Convert RapidOCROutput boxes/txts/scores to the MCP region contract."""
+
+    raw_texts = getattr(result, "txts", None)
+    raw_boxes = getattr(result, "boxes", None)
+    raw_scores = getattr(result, "scores", None)
+    texts = list(raw_texts) if raw_texts is not None else []
+    boxes = list(raw_boxes) if raw_boxes is not None else []
+    scores = list(raw_scores) if raw_scores is not None else []
+    regions: list[dict[str, Any]] = []
+    lines: list[str] = []
+    for index, value in enumerate(texts):
+        text = str(value or "").strip()
+        if not text:
+            continue
+        lines.append(text)
+        region: dict[str, Any] = {"text": text}
+        if index < len(boxes):
+            try:
+                points = list(boxes[index])
+                coordinates = [(float(point[0]), float(point[1])) for point in points if len(point) >= 2]
+                if coordinates:
+                    left = min(point[0] for point in coordinates)
+                    top = min(point[1] for point in coordinates)
+                    right = max(point[0] for point in coordinates)
+                    bottom = max(point[1] for point in coordinates)
+                    region.update(
+                        {
+                            "x": left,
+                            "y": top,
+                            "width": max(0.0, right - left),
+                            "height": max(0.0, bottom - top),
+                        }
+                    )
+            except (TypeError, ValueError, IndexError):
+                pass
+        if index < len(scores):
+            try:
+                region["confidence"] = float(scores[index])
+            except (TypeError, ValueError):
+                pass
+        if "x" not in region and image_size:
+            region.update(
+                {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "width": float(image_size[0]),
+                    "height": float(image_size[1]),
+                    "synthetic": True,
+                    "source": "rapidocr_full_image",
+                }
+            )
+        regions.append(region)
+    return "\n".join(lines), regions
+
+
+def rapidocr_image(image_path: str, language: str = "auto", timeout_sec: int = 30) -> dict[str, Any]:
+    """Run the optional RapidOCR PP-OCRv6-small ONNX fallback locally."""
+
+    started = time.perf_counter()
+    path = Path(image_path).expanduser().resolve()
+    if not path.exists():
+        raise PlatformAutomationError(f"找不到图片: {path}")
+
+    def finish(result: dict[str, Any]) -> dict[str, Any]:
+        output = dict(result)
+        output.setdefault("elapsed_ms", round((time.perf_counter() - started) * 1000.0, 3))
+        return output
+
+    engine, init_error = _rapidocr_engine()
+    if engine is None:
+        missing = _RAPIDOCR_INIT_ERROR is not None and isinstance(
+            _RAPIDOCR_INIT_ERROR, (ImportError, ModuleNotFoundError)
+        )
+        return finish(
+            {
+                "available": not missing,
+                "execution_success": False,
+                "usable": False,
+                "status": "missing_dependency" if missing else "init_error",
+                "backend": "rapidocr_ppocrv6_small",
+                "model": "PP-OCRv6-small-ONNX",
+                "text": "",
+                "message": init_error or "RapidOCR 初始化失败。",
+                "image_path": str(path),
+            }
+        )
+
+    try:
+        result = engine(str(path))
+        text, regions = _rapidocr_regions(result, _rapidocr_png_size(path))
+        return finish(
+            {
+                "available": True,
+                "execution_success": True,
+                "usable": bool(text or regions),
+                "status": "ok" if text or regions else "empty",
+                "backend": "rapidocr_ppocrv6_small",
+                "model": "PP-OCRv6-small-ONNX",
+                "text": text,
+                "regions": regions,
+                "language": language,
+                "engine_elapsed_ms": round(float(getattr(result, "elapse", 0.0) or 0.0) * 1000.0, 3),
+                "image_path": str(path),
+            }
+        )
+    except Exception as exc:
+        return finish(
+            {
+                "available": True,
+                "execution_success": False,
+                "usable": False,
+                "status": "error",
+                "backend": "rapidocr_ppocrv6_small",
+                "model": "PP-OCRv6-small-ONNX",
+                "text": "",
+                "message": str(exc),
+                "image_path": str(path),
+            }
+        )
 
 
 def focused_ocr_image(
@@ -1586,6 +1771,10 @@ def focused_ocr_image(
                     "status": mapped.get("status"),
                     "backend": mapped.get("backend"),
                     "char_count": len(str(mapped.get("text") or "")),
+                    # Keep the bounded per-region text so callers can still
+                    # assign a result to its configured layout region when a
+                    # backend returns aggregate text without word boxes.
+                    "text": str(mapped.get("text") or "")[:4000],
                     "result": mapped,
                 }
             )
@@ -1595,12 +1784,9 @@ def focused_ocr_image(
     seen: set[str] = set()
     for attempt in attempts:
         result = attempt["result"]
-        text = str(result.get("text") or "").strip()
-        if text:
-            key = " ".join(text.split()).casefold()
-            if key not in seen:
-                seen.add(key)
-                fallback_text.append(text)
+        # Prefer line regions over aggregate OCR text.  If the aggregate text
+        # is inserted into ``seen`` first, a region with exactly the same text
+        # is discarded and the downstream spatial parser loses its bbox.
         for item in result.get("regions") or []:
             item_text = str(item.get("text") or "").strip()
             if not item_text:
@@ -1610,6 +1796,12 @@ def focused_ocr_image(
                 continue
             seen.add(key)
             selected_regions.append(dict(item))
+        text = str(result.get("text") or "").strip()
+        if text:
+            key = " ".join(text.split()).casefold()
+            if key not in seen:
+                seen.add(key)
+                fallback_text.append(text)
     selected_regions.sort(
         key=lambda item: (float(item.get("y", 0)), float(item.get("x", 0)))
     )

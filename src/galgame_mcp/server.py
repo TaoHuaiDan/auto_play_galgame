@@ -28,6 +28,7 @@ from .platform import (
     hold_key as native_hold_key,
     image_motion_score as native_image_motion_score,
     ocr_image as native_ocr_image,
+    rapidocr_image as native_rapidocr_image,
     get_window_rect as native_get_window_rect,
     post_window_click as native_post_window_click,
     post_window_key as native_post_window_key,
@@ -342,6 +343,56 @@ def _common_ocr_focus_regions(
     return focus_regions
 
 
+def _focused_result_regions(
+    focused_result: dict[str, Any],
+    focus_regions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep focused OCR spatially classified even when a backend omits bboxes."""
+
+    regions = [dict(item) for item in (focused_result.get("regions") or []) if isinstance(item, dict)]
+    if regions:
+        return regions
+
+    by_label = {
+        str(item.get("label") or ""): item
+        for item in focus_regions
+        if isinstance(item, dict) and str(item.get("label") or "")
+    }
+    recovered: list[dict[str, Any]] = []
+    for attempt in focused_result.get("attempts") or []:
+        if not isinstance(attempt, dict):
+            continue
+        text = str(attempt.get("text") or "").strip()
+        label = str(attempt.get("label") or "")
+        source_region = by_label.get(label)
+        if not text or source_region is None:
+            continue
+        recovered.append(
+            {
+                **source_region,
+                "text": text,
+                "synthetic": True,
+                "source": "focus_region_attempt",
+            }
+        )
+    if recovered:
+        return recovered
+
+    # Mocks and older backends may not include per-region attempt text.  A
+    # single configured focus region is still an unambiguous spatial gate.
+    focused_text = str(focused_result.get("text") or "").strip()
+    if focused_text and len(focus_regions) == 1:
+        return [
+            {
+                **focus_regions[0],
+                "text": focused_text,
+                "synthetic": True,
+                "source": "focus_region_fallback",
+            }
+        ]
+    return []
+
+
 def _mark_ocr_uncertain(
     payload: dict[str, Any],
     image_path: Path,
@@ -382,8 +433,11 @@ mcp = FastMCP(
         "attach_game 默认只验证并绑定窗口，不会切换前台；focus_window=true、focus_before_capture=true 或 background=false 才是明确的前台路径。"
         "ocr_region 是文本框配置；首次窗口帧仍是完整窗口，后续本地 OCR 可使用同一范围的快速区域帧。"
         "快速对白 OCR 为空、仅识别到人物名或只得到 VOICE/AUTO 等界面残留时，会自动做一次完整窗口 OCR 保底；"
+        "如果 Windows OCR 已执行但对白区域语义不可用且安装了 rapidocr extra，会在同一对白帧调用 PP-OCRv6-small ONNX；"
+        "两个后端的 execution_success、usable、story_usable 和耗时会记录在 ocr_backends，不改变 Evidence 或安全推进判定；"
         "正常全窗口 OCR 没有可用故事文本时，才会对当前游戏 profile 的 dialogue_region、speaker_region 和 choice_region"
-        "各做一次 2 倍区域放大 OCR；不做全屏候选搜索、对比度增强或多轮重试。第二次仍无法确认时会返回"
+        "各做一次 2 倍区域放大 OCR；focused OCR 即使没有 word bbox，也会保留其配置区域作为空间证据；"
+        "不做全屏候选搜索、对比度增强或多轮重试。第二次仍无法确认时会返回"
         "ocr_uncertain、保存截图并请求 Codex 视觉复核，自动游玩会在此处停止，不会盲点。"
         "不同游戏的对白框、姓名框、选项区域和姓名/对白符号通过 configure_game_layout 写入当前会话，解析器不按游戏标题猜测符号。"
         "推进后对白框暂时为空时，advance_game/play_until_choice 会在 transition_wait_seconds 的有界等待窗口内本地重试；默认不会发送额外点击。"
@@ -835,7 +889,45 @@ def _compact_ocr_result(result: dict[str, Any]) -> dict[str, Any]:
         compact["message"] = result["message"]
     if result.get("ocr_region"):
         compact["ocr_region"] = result["ocr_region"]
+    for key in ("execution_success", "usable"):
+        if key in result:
+            compact[key] = bool(result[key])
+    for key in ("elapsed_ms", "engine_elapsed_ms"):
+        if key in result:
+            try:
+                compact[key] = round(float(result[key]), 3)
+            except (TypeError, ValueError):
+                pass
+    if result.get("model"):
+        compact["model"] = result["model"]
     return compact
+
+
+def _ocr_execution_success(result: dict[str, Any]) -> bool:
+    """Separate a completed empty OCR pass from a backend execution failure."""
+
+    if "execution_success" in result:
+        return bool(result.get("execution_success"))
+    return str(result.get("status") or "").casefold() in {"ok", "empty"}
+
+
+def _ocr_backend_record(
+    result: dict[str, Any],
+    parsed: dict[str, Any] | None,
+    *,
+    include_raw_text: bool,
+) -> dict[str, Any]:
+    """Persist bounded backend diagnostics without changing the OCR contract."""
+
+    record = _compact_ocr_result(result)
+    record["story_usable"] = _parsed_has_story_text(parsed)
+    record["region_count"] = len(result.get("regions") or [])
+    text = str(result.get("text") or "")
+    if include_raw_text:
+        record["raw_text"] = text[:4000]
+    elif text:
+        record["text_preview"] = text[:1000]
+    return record
 
 
 def _session_layout_profile(session_id: str | None = None) -> dict[str, Any]:
@@ -2189,6 +2281,80 @@ def _process_local_text(
             layout_profile=frame_layout_profile,
         )
 
+    # The optional RapidOCR pass is deliberately narrower than the existing
+    # full-window fallback: it runs only on a fast dialogue crop when the
+    # Windows OCR call completed but did not yield story semantics.  It is a
+    # same-frame backend fallback, not a new capture strategy.
+    normal_story_found = _parsed_has_story_text(parsed) or _parsed_has_story_text(full_parsed)
+    if (
+        payload.get("capture_scope") == "window_dialogue_region"
+        and full_screen_type != "settings"
+        and str(ocr_result.get("backend") or "").casefold() == "windows_ocr"
+        and _ocr_execution_success(ocr_result)
+        and not normal_story_found
+    ):
+        try:
+            rapid_result = native_rapidocr_image(str(image_path), language=language)
+        except Exception as exc:  # pragma: no cover - optional backend boundary
+            rapid_result = {
+                "available": False,
+                "execution_success": False,
+                "usable": False,
+                "status": "error",
+                "backend": "rapidocr_ppocrv6_small",
+                "model": "PP-OCRv6-small-ONNX",
+                "text": "",
+                "message": str(exc),
+            }
+        rapid_text = str(rapid_result.get("text") or "").strip()
+        rapid_parsed: dict[str, Any] | None = None
+        if rapid_text:
+            rapid_parsed = parse_screen_text(
+                rapid_text,
+                regions=rapid_result.get("regions") or [],
+                image_size=image_size,
+                layout_profile=frame_layout_profile,
+            )
+        payload["ocr_backends"] = {
+            "windows_ocr": _ocr_backend_record(
+                ocr_result,
+                parsed,
+                include_raw_text=include_raw_text,
+            ),
+            "rapidocr_ppocrv6_small": _ocr_backend_record(
+                rapid_result,
+                rapid_parsed,
+                include_raw_text=include_raw_text,
+            ),
+            "fallback_reason": "windows_ocr_semantic_unusable",
+        }
+        if _parsed_has_story_text(rapid_parsed):
+            parsed = rapid_parsed
+            full_parsed = rapid_parsed
+            source_result = rapid_result
+            full_source_result = rapid_result
+            raw_text = rapid_text
+            payload["ocr"] = _compact_ocr_result(rapid_result)
+            if include_raw_text:
+                payload["raw_text"] = rapid_text
+            rapid_regions = rapid_result.get("regions") or []
+            payload["_dialogue_ocr_regions"] = rapid_regions
+            capture_region = payload.get("capture_region") or {}
+            try:
+                region_offset_x = int(capture_region.get("x", 0))
+                region_offset_y = int(capture_region.get("y", 0))
+            except (TypeError, ValueError):
+                region_offset_x = region_offset_y = 0
+            payload["_ocr_regions"] = [
+                {
+                    **item,
+                    "x": float(item.get("x", 0)) + region_offset_x,
+                    "y": float(item.get("y", 0)) + region_offset_y,
+                }
+                for item in rapid_regions
+                if isinstance(item, dict)
+            ]
+
     # Only an unusable normal full-window result reaches this second pass.
     # The regions come from the active game's layout profile; there is no
     # full-screen candidate search or multi-variant enhancement loop.
@@ -2234,10 +2400,17 @@ def _process_local_text(
             )
             payload["ocr_focus"] = focus_public
             focused_text = str(focused_result.get("text") or "").strip()
+            focused_regions = _focused_result_regions(focused_result, focus_regions)
+            focus_public["spatial_region_count"] = len(focused_regions)
+            focus_public["synthetic_region_count"] = sum(
+                1 for item in focused_regions if bool(item.get("synthetic"))
+            )
+            if include_raw_text and focused_text:
+                focus_public["raw_text"] = focused_text
             if focused_text:
                 focused_parsed = parse_screen_text(
                     focused_text,
-                    regions=focused_result.get("regions") or [],
+                    regions=focused_regions,
                     image_size=image_size,
                     layout_profile=frame_layout_profile,
                 )
@@ -2247,8 +2420,8 @@ def _process_local_text(
                     source_result = focused_result
                     full_source_result = focused_result
                     raw_text = focused_text
-                    payload["_ocr_regions"] = focused_result.get("regions") or []
-                    payload["_dialogue_ocr_regions"] = focused_result.get("regions") or []
+                    payload["_ocr_regions"] = focused_regions
+                    payload["_dialogue_ocr_regions"] = focused_regions
         else:
             payload["ocr_focus"] = {
                 "attempted": False,
