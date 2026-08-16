@@ -74,6 +74,13 @@ def _looks_like_ui_token(token: str) -> bool:
         ):
             if _within_edit_distance(normalized, word, limit=2):
                 return True
+        # Windows OCR occasionally reads the leading ``L`` in the fixed
+        # ``LOAD`` footer control as a capital ``I``.  Treat only this exact
+        # short shape as a UI-token variant; do not relax the prefix rule for
+        # ordinary words such as ``save`` appearing in story dialogue.
+        if word == "load" and len(normalized) == 4 and normalized[1:] == "oad":
+            if normalized[0] in {"i", "1"}:
+                return True
     return False
 
 

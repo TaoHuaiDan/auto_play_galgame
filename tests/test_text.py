@@ -243,6 +243,13 @@ class TextParserTests(unittest.TestCase):
         self.assertEqual(parsed["dialogue"], "Save me")
         self.assertEqual(parsed["ui_lines"], [])
 
+    def test_classifies_common_l_as_i_load_ocr_variant_as_ui_residue(self) -> None:
+        parsed = parse_screen_text("IOAD")
+
+        self.assertEqual(parsed["dialogue"], "")
+        self.assertEqual(parsed["text_status"], "ui_only")
+        self.assertEqual(parsed["ui_lines"], ["IOAD"])
+
     def test_single_bullet_candidate_inside_dialogue_region_is_dialogue(self) -> None:
         parsed = parse_screen_text(
             "- Save me",
