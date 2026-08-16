@@ -136,6 +136,14 @@ def _looks_like_ui_residue(
         return True
     if any(char in stripped for char in _STORY_PUNCTUATION + "「『【《〈"):
         return False
+    # Full-window fallback OCR can turn a footer icon, cursor, or a single
+    # decorative glyph into an isolated ASCII character (for example ``A``).
+    # A one-character ASCII fragment is not enough evidence to advance a VN;
+    # keep it as UI/OCR residue so the caller can require a real story line or
+    # escalate to visual review.  Marker-prefixed story lines returned above
+    # remain eligible for legitimate punctuation-only dialogue.
+    if re.fullmatch(r"[A-Za-z0-9]", compact):
+        return True
     # Conservative fallback for mixed short OCR fragments such as ``Levy9``
     # or ``V创0``.  Do not classify a plain short English sentence such as
     # ``yes`` as UI: that is a legitimate line in another visual novel.

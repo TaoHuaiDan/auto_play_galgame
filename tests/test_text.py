@@ -250,6 +250,20 @@ class TextParserTests(unittest.TestCase):
         self.assertEqual(parsed["text_status"], "ui_only")
         self.assertEqual(parsed["ui_lines"], ["IOAD"])
 
+    def test_classifies_isolated_ascii_fragment_as_ui_residue(self) -> None:
+        parsed = parse_screen_text(
+            "A",
+            regions=[
+                {"text": "A", "x": 700, "y": 600, "width": 24, "height": 24},
+            ],
+            image_size=(1000, 800),
+            layout_profile=SPATIAL_PROFILE,
+        )
+
+        self.assertEqual(parsed["dialogue"], "")
+        self.assertEqual(parsed["text_status"], "ui_only")
+        self.assertEqual(parsed["ui_lines"], ["A"])
+
     def test_single_bullet_candidate_inside_dialogue_region_is_dialogue(self) -> None:
         parsed = parse_screen_text(
             "- Save me",
