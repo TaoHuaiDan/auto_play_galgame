@@ -240,7 +240,7 @@ record_parsed_text(raw_text="...", screenshot_path="...")
 
 如果不希望游戏抢到前台，可使用 `background_press_key`、`background_click`、`background_scroll`；`advance_game`、`play_until_choice` 和 `select_choice` 默认使用后台窗口消息，需要前台输入时显式传 `background=false`。底层 `background_*` 接口默认用 `delivery="post"` 通过 `PostMessageW` 排队；高层自动游玩工具的后台输入默认用 `background_input_method="send"`，通过带超时的 `SendMessageTimeoutW` 直接调用窗口过程，实测对本游戏更可靠。两种方式都不调用 `SetForegroundWindow`、不移动真实鼠标；`queued=true`/`delivered=true` 只代表系统层结果，不代表游戏一定执行了动作。只读 Win32 消息的引擎适合这几条路径；Raw Input、DirectInput、部分 Unity/独占渲染输入路径可能忽略它们，此时应显式回退到前台 `SendInput` 或游戏专用适配器。窗口消息点击和滚轮的坐标使用屏幕坐标，MCP 会在本地转换鼠标移动消息的客户区坐标。`click_screen(input_method="touch")` 还提供显式 Windows 触摸注入备用路径。后台模式下设置页恢复也使用窗口消息点击；如果未找到明确“回到游戏/返回游戏”按钮，仍不会猜测输入。
 
-完整窗口 OCR 先正常使用 Windows OCR。已配置 `dialogue_region` 的游戏会先走快速对白区域；快速区域为空、只有人物名或只有 VOICE/AUTO 等界面残留时，MCP 会捕获完整窗口并再次使用 Windows OCR。只有完整窗口 Windows OCR 仍没有可用剧情文本时，才会在同一张完整窗口截图上调用可选的 RapidOCR PP-OCRv6-small ONNX 后端。RapidOCR 只作为识别失败保底，不参与快速区域的正常路径，也不再执行旧的 2 倍 focused OCR。两个后端的执行状态、可用性、解析是否足以作为剧情文本和耗时会记录在 `ocr_backends`；RapidOCR 成功且解析出对白/选项时才替换当前结果。仍无法确认时，MCP 会保存并返回截图，标记 `ocr_uncertain`，由 Codex 进行一次视觉复核，自动游玩在此处停止。不会做全屏候选搜索、对比度增强或多轮重试。
+完整窗口 OCR 先正常使用 Windows OCR。已配置 `dialogue_region` 的游戏会先走快速对白区域；快速区域为空、只有人物名或只有 VOICE/AUTO 等界面残留时，MCP 会捕获完整窗口并再次使用 Windows OCR。只有完整窗口 Windows OCR 仍没有可用剧情文本时，才会在同一张完整窗口截图上调用可选的 RapidOCR PP-OCRv6-small ONNX 后端。RapidOCR 只作为识别失败保底，不参与快速区域的正常路径，也不再执行旧的 2 倍 focused OCR。两个后端共用同一套 `layout_profile`、空间分类和文本解析规则；执行状态、可用性、解析是否足以作为剧情文本和耗时会记录在 `ocr_backends`。RapidOCR 成功且解析出对白/选项时才替换当前结果。RapidOCR 识别出正常对白后，若剩余未知框全部位于已知对白/姓名/选项区域之外，则这些未知内容只记录为 `unknown_lines`，不会单独触发安全停机；未知框位于剧情区域内、没有可靠坐标，或 Windows OCR 路径出现同类未知时仍按保守策略阻断。仍无法确认时，MCP 会保存并返回截图，标记 `ocr_uncertain`，由 Codex 进行一次视觉复核，自动游玩在此处停止。不会做全屏候选搜索、对比度增强或多轮重试。
 
 RapidOCR 是可选后端，不改变现有 Windows OCR 返回结构。安装：
 
@@ -262,7 +262,16 @@ configure_game_layout(profile={
   "choice_region": {"x": 0.2, "y": 0.2, "width": 0.6, "height": 0.5, "coordinate_space": "normalized"},
   "speaker_markers": [{"open": "<NAME>", "close": "</NAME>", "allow_unclosed": true}],
   "dialogue_markers": [{"open": "<TEXT>", "close": "</TEXT>"}],
-  "choice_layout": "vertical"
+  "choice_layout": "vertical",
+  "ocr_ignore_regions": [
+    {"name": "window_titlebar", "x": 0, "y": 0, "width": 1, "height": 0.05, "coordinate_space": "normalized"},
+    {"name": "chapter_banner", "x": 0, "y": 0.05, "width": 0.24, "height": 0.16, "coordinate_space": "normalized"},
+    {"name": "fixed_footer", "x": 0, "y": 0.91, "width": 1, "height": 0.09, "coordinate_space": "normalized"}
+  ],
+  "ocr_blacklist": [
+    {"text": "RIDDLE JOKER", "match": "exact", "region": "window_titlebar", "reason": "固定窗口标题"},
+    {"text": "CHAPTER", "match": "contains", "region": "chapter_banner", "reason": "章节装饰"}
+  ]
 })
 configure_game_actions(actions={
   "hide_ui": {"kind": "click", "target": "window_center", "button": "right", "delivery": "send"},
@@ -279,6 +288,8 @@ observe_game()
 ```
 
 `configure_game_actions` 是跨游戏的动作适配层：profile 只描述 `click`、`key`、`scroll`、`hold`、`wait`、`focus` 六类安全动作，不写入游戏标题专用代码。点击可以使用屏幕坐标，也可以使用窗口中心或 `window_normalized` 的 0 到 1 相对坐标；`delivery` 支持 `post` 和 `send`。之后调用 `perform_game_action` 执行命名动作，`parameters` 可以在单次调用中覆盖 profile 的按键、方向、坐标或等待时间。绑定窗口时 click/key/scroll 默认走后台消息，hold/focus/wait 默认保持前台或本地执行；需要改变默认行为时显式传 `background`。`hide_ui`、`return_game` 等名称只是 profile 示例，不会被代码写死，换游戏只需重新配置映射。`advance_game` 等高层工具仍保留，适合默认推进流程。
+
+`ocr_ignore_regions` 和 `ocr_blacklist` 是按游戏配置的 OCR 噪声规则，不是针对某个游戏写死的分支。`ocr_ignore_regions` 中的文字框会从 `speaker`、`dialogue`、`choice` 和 `unknown` 语义解析中排除，适合窗口标题栏、固定 Logo、章节横幅和底部控制条；这些文字仍保留在 `raw_text`，并会出现在 `processed_text.ignored_lines`、`noise_flags` 的 `blacklisted_ocr` 项以及 `evidence.ignored_ocr_lines` 中。区域名可供 `ocr_blacklist.region` 引用；黑名单支持 `exact`、`contains` 和 `regex`，不指定区域时按文本匹配。区域过滤是整框过滤，配置时不要覆盖对白框或选项区，否则可能把真实剧情一起忽略。换游戏时先用一次完整窗口 OCR 观察固定装饰的坐标，再把确认无关的区域加入 profile。
 
 ### 分段剧情压缩
 
@@ -315,7 +326,7 @@ play_until_choice(background=true, wait_seconds=0.05, transition_wait_seconds=1.
 
 该工具在 MCP 本地循环捕获、OCR、解析并保存每条对白，然后自动推进；默认停止条件是识别到真实选项、OCR/输入无法安全确认，或原始事件存储达到压缩阈值。达到 `compaction_due` 后，Codex 应先调用 `get_compaction_request`、生成并 `save_compaction`，再继续游玩；此时不会把整个原始 batch 再传给 Codex，只返回压缩状态和计数。正常帧只读取底部对白框；如果推进后对白框暂时为空，会在 `transition_wait_seconds` 的有界时间内用递增短等待重试。只有配置并确认 `transition_accelerate=true` 时，才会按上面的完整窗口多帧规则最多额外点击一次；默认不会在转场中盲点。等待结束后才对完整窗口做一次专门的选项 OCR，避免每帧扫描全屏，也避免在转场中误选。`max_steps` 和 `max_batch_chars` 仍可显式传入，仅用于冒烟测试或调用方自己的响应边界；省略它们时不设默认步数/批次字符上限。设置页会尝试点击明确的“回到游戏/返回游戏”，OCR 空帧、未识别对白等均归入安全停机；如果因 `dialogue_not_detected` 或 `ocr_unavailable` 停止，会自动附带最后一张完整窗口图并标记 `manual_intervention.required=true`，让 Codex 读图后用 `record_observation` 或一次 `advance_game` 接管。中间正常帧不会逐次传给 Codex，因此适合连续无人值守游玩。
 
-每次本地解析还会附带精简的 `evidence`：`channels` 分开表示 `dialogue`、`speaker`、`choice`、`system_ui`、`unknown_text` 和转场状态，`safe_to_advance=false` 时不会把未知文字当作普通对白继续推进。`ui_lines` 记录 `SAVE/LOAD/VOICE` 等残留，`unknown_lines` 记录无法按当前布局确认的文字；它们不会从原始 OCR 中删除。`unknown_text_detected` 是需要 Codex 接管的安全停机原因。对白会生成稳定的 `episode_id`，便于跨帧去重和后续压缩；只有姓名框的旧版兼容路径仍可推进，因为部分引擎会把省略号等极短对白漏给 OCR。
+每次本地解析还会附带精简的 `evidence`：`channels` 分开表示 `dialogue`、`speaker`、`choice`、`system_ui`、`unknown_text` 和转场状态，`safe_to_advance=false` 时不会把剧情区域内的未知文字当成普通对白继续推进。`ui_lines` 记录 `SAVE/LOAD/VOICE` 等残留，`unknown_lines` 记录无法按当前布局确认的文字，`ignored_lines` 记录 profile 已确认无关的固定 OCR 框；它们都不会从原始 OCR 中删除。RapidOCR 已确认正常剧情后，剧情区域外的未知行会在 `evidence.unknown_text` 中保留，并标记 `non_blocking_unknown_text=true`，供 Codex 在批量 JSON 中复核；`unknown_text_detected` 仍表示需要接管的安全停机原因。对白会生成稳定的 `episode_id`，便于跨帧去重和后续压缩；只有姓名框的旧版兼容路径仍可推进，因为部分引擎会把省略号等极短对白漏给 OCR。
 
 如果默认队列方式没有推进，可改用直接窗口过程方式：
 

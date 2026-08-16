@@ -54,6 +54,37 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(evidence["channels"]["transient_story_text"]["resolved"])
         self.assertTrue(evidence["channels"]["scene_label"]["blocking"])
 
+    def test_rapidocr_unknown_decoration_outside_story_region_is_recorded_without_blocking(self) -> None:
+        evidence = build_frame_evidence(
+            {
+                "dialogue": "「正常对白」",
+                "choices": [],
+                "unknown_lines": ["RIDDLE JOKER"],
+                "unknown_story_lines": [],
+            },
+            allow_unknown_with_story=True,
+        )
+
+        self.assertTrue(evidence["safe_to_advance"])
+        self.assertNotIn("unknown_text", evidence["blocking_reasons"])
+        self.assertTrue(evidence["non_blocking_unknown_text"])
+        self.assertFalse(evidence["channels"]["unknown_text"]["blocking"])
+        self.assertIn("RIDDLE JOKER", evidence["channels"]["unknown_text"]["text"])
+
+    def test_rapidocr_unknown_text_inside_story_region_still_blocks(self) -> None:
+        evidence = build_frame_evidence(
+            {
+                "dialogue": "「正常对白」",
+                "choices": [],
+                "unknown_lines": ["可能是选项"],
+                "unknown_story_lines": ["可能是选项"],
+            },
+            allow_unknown_with_story=True,
+        )
+
+        self.assertFalse(evidence["safe_to_advance"])
+        self.assertIn("unknown_text", evidence["blocking_reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

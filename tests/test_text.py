@@ -313,6 +313,70 @@ class TextParserTests(unittest.TestCase):
         self.assertEqual(parsed["unknown_lines"], ["Chapter 1"])
         self.assertEqual(parsed["text_status"], "unknown")
 
+    def test_profiled_ocr_decorations_are_ignored_but_kept_as_metadata(self) -> None:
+        profile = {
+            **SPATIAL_PROFILE,
+            "ocr_ignore_regions": [
+                {
+                    "name": "fixed_logo",
+                    "x": 0.10,
+                    "y": 0.70,
+                    "width": 0.20,
+                    "height": 0.20,
+                    "coordinate_space": "normalized",
+                },
+            ],
+            "ocr_blacklist": [
+                {
+                    "text": "RIDDLE JOKER",
+                    "match": "exact",
+                    "reason": "window title decoration",
+                },
+            ],
+        }
+        raw_text = "RIDDLE JOKER\nRIDDLE\n「对白」"
+        regions = [
+            {"text": "RIDDLE JOKER", "x": 10, "y": 10, "width": 160, "height": 24},
+            {"text": "RIDDLE", "x": 150, "y": 600, "width": 100, "height": 50},
+            {"text": "「对白」", "x": 400, "y": 600, "width": 180, "height": 40},
+        ]
+
+        parsed = parse_screen_text(
+            raw_text,
+            regions=regions,
+            image_size=(1000, 800),
+            layout_profile=profile,
+        )
+
+        self.assertEqual(parsed["dialogue"], "「对白」")
+        self.assertEqual(parsed["unknown_lines"], [])
+        self.assertEqual(
+            [item["text"] for item in parsed["ignored_lines"]],
+            ["RIDDLE JOKER", "RIDDLE"],
+        )
+        self.assertIn("RIDDLE JOKER", parsed["raw_text"])
+        self.assertIn("RIDDLE", parsed["raw_text"])
+        self.assertIn(
+            "blacklisted_ocr",
+            {flag["code"] for flag in parsed["noise_flags"]},
+        )
+
+    def test_unknown_story_lines_only_include_unknown_boxes_inside_story_regions(self) -> None:
+        inside = "0」RIDDLE」OKER: C Search for RiddIe"
+        outside = "Chapter 1"
+        parsed = parse_screen_text(
+            f"{inside}\n{outside}",
+            regions=[
+                {"text": inside, "x": 400, "y": 600, "width": 280, "height": 36},
+                {"text": outside, "x": 40, "y": 100, "width": 180, "height": 30},
+            ],
+            image_size=(1000, 800),
+            layout_profile=SPATIAL_PROFILE,
+        )
+
+        self.assertEqual(parsed["unknown_lines"], [inside, outside])
+        self.assertEqual(parsed["unknown_story_lines"], [inside])
+
     def test_configured_marker_profile_does_not_guess_unmarked_colon_ui(self) -> None:
         parsed = parse_screen_text(
             "0」RIDDLE」OKER: C Search for RiddIe",

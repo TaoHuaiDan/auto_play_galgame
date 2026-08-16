@@ -340,10 +340,13 @@ mcp = FastMCP(
         "快速对白 OCR 为空、仅识别到人物名或只得到 VOICE/AUTO 等界面残留时，会自动捕获完整窗口并再次使用 Windows OCR；"
         "完整窗口的 Windows OCR 仍没有可用剧情文本时，才会在同一张完整窗口截图上调用可选的 RapidOCR PP-OCRv6-small ONNX；"
         "RapidOCR 只作为失败保底，不参与快速对白区域的正常路径，也不再执行旧的 2 倍 focused OCR；"
-        "两个后端的 execution_success、usable、story_usable 和耗时会记录在 ocr_backends，不改变 Evidence 或安全推进判定；"
+        "两个后端共用同一套 layout_profile 空间分类和文本解析；execution_success、usable、story_usable 和耗时会记录在 ocr_backends。"
+        "RapidOCR 已识别出正常剧情且未知框全部在剧情区域外时，未知行只记录在 processed_text/evidence，不单独阻断；剧情区域内未知框仍阻断；"
         "不做全屏候选搜索、对比度增强或多轮重试。Windows OCR 与 RapidOCR 仍无法确认时会返回"
         "ocr_uncertain、保存截图并请求 Codex 视觉复核，自动游玩会在此处停止，不会盲点。"
         "不同游戏的对白框、姓名框、选项区域和姓名/对白符号通过 configure_game_layout 写入当前会话，解析器不按游戏标题猜测符号。"
+        "ocr_ignore_regions 可按坐标过滤确认无关的标题栏、Logo、章节横幅或底部 UI，ocr_blacklist 可按 exact/contains/regex 过滤固定 OCR 文本；"
+        "过滤项仍保留在 raw_text、ignored_lines 和 evidence 中，不能覆盖对白或选项区域。"
         "推进后对白框暂时为空时，advance_game/play_until_choice 会在 transition_wait_seconds 的有界等待窗口内本地重试；默认不会发送额外点击。"
         "只有配置 transition_accelerate=true 且完整窗口连续探测确认画面发生明显转场时，才最多额外点击一次；稳定画面 OCR 为空仍返回 ocr_uncertain。"
         "等待策略通过 configure_game_timing 按游戏配置；fixed 适合关闭打字机动画的游戏，text_hash 会要求点击后底部文本先变化并连续稳定若干次，才允许下一次输入。"
@@ -773,9 +776,15 @@ def _public_parsed_text(parsed: dict[str, Any]) -> dict[str, Any]:
         "confidence": parsed.get("confidence", 0.0),
         "noise_flags": copy.deepcopy(parsed.get("noise_flags") or []),
     }
-    for key in ("ui_lines", "unknown_lines", "text_status"):
+    for key in ("ui_lines", "unknown_lines", "ignored_lines", "text_status"):
         if parsed.get(key):
             public[key] = copy.deepcopy(parsed[key])
+    # An explicit empty list is meaningful here: it says the parser had OCR
+    # geometry and confirmed that all unknown boxes were outside the story
+    # regions.  Dropping it would make Evidence fall back to the old,
+    # fail-closed interpretation at the MCP boundary.
+    if "unknown_story_lines" in parsed:
+        public["unknown_story_lines"] = copy.deepcopy(parsed.get("unknown_story_lines") or [])
     if parsed.get("screen_type"):
         public["screen_type"] = parsed["screen_type"]
     return public
@@ -818,6 +827,9 @@ def _ocr_backend_record(
     record = _compact_ocr_result(result)
     record["story_usable"] = _parsed_has_story_text(parsed)
     record["region_count"] = len(result.get("regions") or [])
+    if isinstance(parsed, dict):
+        record["unknown_line_count"] = len(parsed.get("unknown_lines") or [])
+        record["ignored_line_count"] = len(parsed.get("ignored_lines") or [])
     text = str(result.get("text") or "")
     if include_raw_text:
         record["raw_text"] = text[:4000]
@@ -975,6 +987,39 @@ def _layout_profile_for_capture(
             "height": height,
             "coordinate_space": "pixels",
         }
+    ignore_regions = stored.get("ocr_ignore_regions")
+    if isinstance(ignore_regions, dict):
+        ignore_regions = [
+            {**value, "name": value.get("name") or name}
+            for name, value in ignore_regions.items()
+            if isinstance(value, dict)
+        ]
+    if isinstance(ignore_regions, list):
+        projected_ignore_regions: list[dict[str, Any]] = []
+        for index, region in enumerate(ignore_regions, start=1):
+            if not isinstance(region, dict):
+                continue
+            absolute = _layout_region_values(
+                region,
+                default_space="normalized",
+                full_size=full_size,
+                dialogue_bounds=dialogue_bounds,
+                current_size=image_size,
+            )
+            if absolute is None:
+                continue
+            x, y, width, height = absolute
+            projected_ignore_regions.append(
+                {
+                    "name": str(region.get("name") or region.get("id") or f"region_{index}"),
+                    "x": x - origin[0],
+                    "y": y - origin[1],
+                    "width": width,
+                    "height": height,
+                    "coordinate_space": "pixels",
+                }
+            )
+        profile["ocr_ignore_regions"] = projected_ignore_regions
     profile["_capture_scope"] = capture_scope
     return profile
 
@@ -2281,6 +2326,9 @@ def _process_local_text(
         public_parsed,
         screen_type=screen_type,
         ocr_available=bool((payload.get("ocr") or {}).get("available")),
+        allow_unknown_with_story=(
+            source_result.get("backend") == "rapidocr_ppocrv6_small"
+        ),
     )
     # Settings controls are not story choices. Keep the screenshot and OCR
     # result, but do not pollute the route timeline with fake dialogue/options.

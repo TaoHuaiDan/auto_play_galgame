@@ -108,6 +108,116 @@ def _normalise_layout_profile(profile: Any) -> dict[str, Any]:
             raise SessionError(f"layout_profile.{name} 的 pixels 坐标和尺寸不能为负数")
         region["coordinate_space"] = coordinate_space
 
+    # Full-window fallback OCR also sees title bars, logos, chapter banners,
+    # and fixed footer controls.  Keep these exclusions in the per-game
+    # profile so another game can supply its own coordinates without adding a
+    # title-specific branch to the parser.
+    ignore_regions = copied.get("ocr_ignore_regions")
+    if ignore_regions is not None:
+        if isinstance(ignore_regions, dict):
+            converted_regions: list[dict[str, Any]] = []
+            for region_name, region in ignore_regions.items():
+                if not isinstance(region, dict):
+                    raise SessionError("layout_profile.ocr_ignore_regions 的每项必须是区域对象")
+                converted = copy.deepcopy(region)
+                converted.setdefault("name", region_name)
+                converted_regions.append(converted)
+            ignore_regions = converted_regions
+            copied["ocr_ignore_regions"] = ignore_regions
+        if not isinstance(ignore_regions, list) or len(ignore_regions) > 64:
+            raise SessionError("layout_profile.ocr_ignore_regions 必须是最多 64 项的数组")
+        normalised_ignore_regions: list[dict[str, Any]] = []
+        for index, region in enumerate(ignore_regions, start=1):
+            if not isinstance(region, dict):
+                raise SessionError("layout_profile.ocr_ignore_regions 的每项必须是区域对象")
+            name = _clean_text(region.get("name") or region.get("id")) or f"region_{index}"
+            if len(name) > 64:
+                raise SessionError("layout_profile.ocr_ignore_regions.name 不能超过 64 个字符")
+            try:
+                values = [float(region[key]) for key in ("x", "y", "width", "height")]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise SessionError(
+                    "layout_profile.ocr_ignore_regions 必须包含数字 x、y、width、height"
+                ) from exc
+            if not all(math.isfinite(value) for value in values):
+                raise SessionError("layout_profile.ocr_ignore_regions 不能包含 NaN 或无穷大")
+            coordinate_space = str(region.get("coordinate_space") or "normalized").strip().casefold()
+            allowed_spaces = {
+                "normalized",
+                "normalised",
+                "relative",
+                "fraction",
+                "pixels",
+                "pixel",
+                "absolute",
+                "image",
+            }
+            if coordinate_space not in allowed_spaces:
+                raise SessionError(
+                    "layout_profile.ocr_ignore_regions.coordinate_space 不受支持: "
+                    f"{coordinate_space}"
+                )
+            if coordinate_space in {"normalized", "normalised", "relative", "fraction", "image"}:
+                if any(value < 0 or value > 1 for value in values):
+                    raise SessionError(
+                        "layout_profile.ocr_ignore_regions 的 normalized 坐标和尺寸必须在 0 到 1 之间"
+                    )
+            elif any(value < 0 for value in values):
+                raise SessionError("layout_profile.ocr_ignore_regions 的 pixels 坐标和尺寸不能为负数")
+            normalised_ignore_regions.append(
+                {
+                    "name": name,
+                    "x": values[0],
+                    "y": values[1],
+                    "width": values[2],
+                    "height": values[3],
+                    "coordinate_space": coordinate_space,
+                }
+            )
+        copied["ocr_ignore_regions"] = normalised_ignore_regions
+
+    blacklist = copied.get("ocr_blacklist")
+    if blacklist is not None:
+        if isinstance(blacklist, (str, int, float)):
+            blacklist = [blacklist]
+            copied["ocr_blacklist"] = blacklist
+        if not isinstance(blacklist, list) or len(blacklist) > 128:
+            raise SessionError("layout_profile.ocr_blacklist 必须是最多 128 项的数组")
+        normalised_blacklist: list[dict[str, Any]] = []
+        for item in blacklist:
+            if isinstance(item, dict):
+                value = _clean_text(item.get("text") or item.get("value") or item.get("pattern"))
+                match = str(item.get("match") or "exact").strip().casefold()
+                region_name = _clean_text(item.get("region") or item.get("region_name"))
+                reason = _clean_text(item.get("reason"))
+            else:
+                value = _clean_text(item)
+                match = "exact"
+                region_name = None
+                reason = None
+            if not value:
+                raise SessionError("layout_profile.ocr_blacklist 的每项必须包含非空 text")
+            if match not in {"exact", "contains", "regex"}:
+                raise SessionError("layout_profile.ocr_blacklist.match 必须是 exact、contains 或 regex")
+            if len(value) > 256:
+                raise SessionError("layout_profile.ocr_blacklist.text 不能超过 256 个字符")
+            if region_name and len(region_name) > 64:
+                raise SessionError("layout_profile.ocr_blacklist.region 不能超过 64 个字符")
+            if match == "regex":
+                try:
+                    re.compile(value)
+                except re.error as exc:
+                    raise SessionError("layout_profile.ocr_blacklist 的 regex 无效") from exc
+            normalised_blacklist.append(
+                {
+                    "text": value,
+                    "match": match,
+                    **({"region": region_name} if region_name else {}),
+                    **({"reason": reason[:160]} if reason else {}),
+                }
+            )
+        copied["ocr_blacklist"] = normalised_blacklist
+
     for key in ("speaker_markers", "dialogue_markers"):
         markers = copied.get(key)
         if markers is None:

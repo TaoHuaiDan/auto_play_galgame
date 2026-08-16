@@ -1969,8 +1969,9 @@ class BatchPlayTests(unittest.TestCase):
             "status": "ok",
             "backend": "rapidocr_ppocrv6_small",
             "model": "PP-OCRv6-small-ONNX",
-            "text": "【晓】\n「……？」",
+            "text": "RIDDLE JOKER\n【晓】\n「……？」",
             "regions": [
+                {"text": "RIDDLE JOKER", "x": 10, "y": 10, "width": 160, "height": 24},
                 {"text": "【晓】", "x": 300, "y": 580, "width": 80, "height": 24},
                 {"text": "「……？」", "x": 300, "y": 640, "width": 150, "height": 28},
             ],
@@ -1994,6 +1995,10 @@ class BatchPlayTests(unittest.TestCase):
         self.assertEqual(processed["processed_text"]["speaker"], "晓")
         self.assertEqual(processed["ocr"]["backend"], "rapidocr_ppocrv6_small")
         self.assertTrue(processed["ocr_backends"]["rapidocr_ppocrv6_small"]["story_usable"])
+        self.assertEqual(processed["processed_text"]["unknown_lines"], ["RIDDLE JOKER"])
+        self.assertEqual(processed["processed_text"].get("unknown_story_lines", []), [])
+        self.assertTrue(processed["evidence"]["non_blocking_unknown_text"])
+        self.assertNotIn("unknown_text", processed["evidence"]["blocking_reasons"])
         self.assertNotIn("ocr_uncertain", processed)
         rapid_call.assert_called_once_with(str(Path("C:/full.png").resolve()), language="auto")
 

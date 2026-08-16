@@ -51,10 +51,31 @@ class SessionStoreTests(unittest.TestCase):
                     "speaker_region": {"x": 0, "y": 0, "width": 1, "height": 0.4},
                     "speaker_markers": [{"open": "<", "close": ">", "allow_unclosed": True}],
                     "dialogue_markers": [{"open": "{", "close": "}"}],
+                    "ocr_ignore_regions": [
+                        {
+                            "name": "fixed_footer",
+                            "x": 0,
+                            "y": 0.9,
+                            "width": 1,
+                            "height": 0.1,
+                            "coordinate_space": "normalized",
+                        },
+                    ],
+                    "ocr_blacklist": [
+                        {"text": "RIDDLE JOKER", "match": "exact"},
+                    ],
                 }
             )
             self.assertEqual(configured["layout_profile"]["speaker_markers"][0]["open"], "<")
             self.assertEqual(store.get_session()["game"]["layout_profile"]["dialogue_region"]["width"], 0.8)
+            self.assertEqual(
+                store.get_session()["game"]["layout_profile"]["ocr_ignore_regions"][0]["name"],
+                "fixed_footer",
+            )
+            self.assertEqual(
+                store.get_session()["game"]["layout_profile"]["ocr_blacklist"][0]["match"],
+                "exact",
+            )
 
             configured_actions = store.configure_game_actions(
                 {

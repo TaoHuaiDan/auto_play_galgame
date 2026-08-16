@@ -304,6 +304,9 @@ def _normalise_lines(raw_text: str) -> list[str]:
 def _ocr_noise_flags(
     raw_text: str,
     layout_profile: dict[str, Any] | None,
+    *,
+    regions: list[dict[str, Any]] | None = None,
+    image_size: tuple[int, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Annotate likely OCR artifacts without changing the source text.
 
@@ -325,7 +328,16 @@ def _ocr_noise_flags(
         code: str | None = None
         severity = "low"
         reason = ""
-        if _NOISE.fullmatch(line):
+        ignored = _ocr_blacklist_match(
+            line,
+            _region_for_line(line, regions),
+            image_size=image_size,
+            layout_profile=layout_profile,
+        )
+        if ignored:
+            code = "blacklisted_ocr"
+            reason = str(ignored.get("reason") or "matched configured OCR ignore rule")
+        elif _NOISE.fullmatch(line):
             code = "separator_or_ui"
             reason = "separator or common UI token was removed by conservative line normalization"
         elif "\ufffd" in line or "\x00" in line:
@@ -431,7 +443,7 @@ def _profile_region_bounds(
     if width <= 0 or height <= 0:
         return None
     coordinate_space = str(region.get("coordinate_space") or "").strip().casefold()
-    if coordinate_space in {"normalized", "normalised", "relative", "fraction", "dialogue_region", "dialogue_box"}:
+    if coordinate_space in {"normalized", "normalised", "relative", "fraction", "dialogue_region", "dialogue_box", "image"}:
         x *= width
         y *= height
         region_width *= width
@@ -456,6 +468,151 @@ def _point_in_bounds(point: tuple[float, float], bounds: tuple[float, float, flo
     x, y = point
     left, top, width, height = bounds
     return left <= x <= left + width and top <= y <= top + height
+
+
+def _ocr_blacklist_specs(profile: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return validated-looking per-game OCR blacklist entries."""
+
+    if not isinstance(profile, dict):
+        return []
+    raw = profile.get("ocr_blacklist") or []
+    if isinstance(raw, (str, int, float)):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    specs: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            value = str(item.get("text") or item.get("value") or item.get("pattern") or "").strip()
+            match = str(item.get("match") or "exact").strip().casefold()
+            region = str(item.get("region") or item.get("region_name") or "").strip() or None
+            reason = str(item.get("reason") or "").strip()
+        else:
+            value = str(item or "").strip()
+            match = "exact"
+            region = None
+            reason = ""
+        if value and match in {"exact", "contains", "regex"}:
+            specs.append(
+                {
+                    "text": value,
+                    "match": match,
+                    "region": region,
+                    "reason": reason,
+                }
+            )
+    return specs
+
+
+def _ocr_ignore_region_match(
+    region: dict[str, Any] | None,
+    *,
+    image_size: tuple[int, int] | None,
+    layout_profile: dict[str, Any] | None,
+) -> str | None:
+    """Return the fixed non-story region containing an OCR box, if any."""
+
+    if not isinstance(region, dict) or not image_size or not isinstance(layout_profile, dict):
+        return None
+    center = _region_center(region)
+    if center is None:
+        return None
+    raw_regions = layout_profile.get("ocr_ignore_regions") or []
+    if isinstance(raw_regions, dict):
+        raw_regions = [
+            {**value, "name": value.get("name") or name}
+            for name, value in raw_regions.items()
+            if isinstance(value, dict)
+        ]
+    if not isinstance(raw_regions, (list, tuple)):
+        return None
+    for index, item in enumerate(raw_regions, start=1):
+        if not isinstance(item, dict):
+            continue
+        bounds = _profile_region_bounds({"_ignore": item}, "_ignore", image_size)
+        if bounds is None or not _point_in_bounds(center, bounds):
+            continue
+        return str(item.get("name") or item.get("id") or f"region_{index}")
+    return None
+
+
+def _ocr_blacklist_match(
+    line: str,
+    region: dict[str, Any] | None,
+    *,
+    image_size: tuple[int, int] | None,
+    layout_profile: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Match one OCR line against text or region-scoped noise rules."""
+
+    stripped = str(line or "").strip()
+    if not stripped:
+        return None
+    region_name = _ocr_ignore_region_match(
+        region,
+        image_size=image_size,
+        layout_profile=layout_profile,
+    )
+    # Region exclusions intentionally ignore all OCR text in that box, but
+    # the line is returned as structured metadata and remains in raw_text.
+    if region_name:
+        return {
+            "text": stripped,
+            "region": region_name,
+            "rule": f"region:{region_name}",
+            "reason": "OCR box is inside a configured fixed non-story region",
+        }
+
+    compact_line = _compact_ocr_text(stripped).casefold()
+    for spec in _ocr_blacklist_specs(layout_profile):
+        required_region = spec.get("region")
+        if required_region and required_region != region_name:
+            continue
+        value = str(spec.get("text") or "")
+        match = str(spec.get("match") or "exact").casefold()
+        compact_value = _compact_ocr_text(value).casefold()
+        matched = False
+        if match == "exact":
+            matched = bool(compact_line and compact_line == compact_value)
+        elif match == "contains":
+            matched = bool(compact_value and compact_value in compact_line)
+        elif match == "regex":
+            try:
+                matched = bool(re.search(value, stripped, flags=re.IGNORECASE))
+            except re.error:
+                matched = False
+        if matched:
+            return {
+                "text": stripped,
+                "region": region_name,
+                "rule": value,
+                "match": match,
+                "reason": spec.get("reason") or "matched configured OCR blacklist",
+            }
+    return None
+
+
+def _unknown_line_in_story_region(
+    line: str,
+    regions: list[dict[str, Any]] | None,
+    image_size: tuple[int, int] | None,
+    layout_profile: dict[str, Any] | None,
+) -> bool:
+    """Fail closed when an unknown OCR box overlaps a story-capable region."""
+
+    if not isinstance(layout_profile, dict):
+        return True
+    region = _region_for_line(line, regions)
+    if region is None or not image_size:
+        return True
+    center = _region_center(region)
+    if center is None:
+        return True
+    for key in ("choice_region", "dialogue_region", "speaker_region"):
+        bounds = _profile_region_bounds(layout_profile, key, image_size)
+        if bounds is not None and _point_in_bounds(center, bounds):
+            return True
+    return False
 
 
 def _match_marker_line(
@@ -715,7 +872,20 @@ def parse_screen_text(
     still handles numeric choices and ``name: dialogue`` text.
     """
 
-    lines = _normalise_lines(raw_text)
+    raw_lines = _normalise_lines(raw_text)
+    ignored_lines: list[dict[str, Any]] = []
+    lines: list[str] = []
+    for line in raw_lines:
+        ignored = _ocr_blacklist_match(
+            line,
+            _region_for_line(line, regions),
+            image_size=image_size,
+            layout_profile=layout_profile if isinstance(layout_profile, dict) else {},
+        )
+        if ignored:
+            ignored_lines.append(ignored)
+            continue
+        lines.append(line)
     choice_records: list[dict[str, Any]] = []
     dialogue_lines: list[str] = []
     unparsed_lines: list[str] = []
@@ -724,7 +894,12 @@ def parse_screen_text(
     speaker: str | None = None
     explicit_speaker = False
     profile = layout_profile if isinstance(layout_profile, dict) else {}
-    noise_flags = _ocr_noise_flags(raw_text, profile)
+    noise_flags = _ocr_noise_flags(
+        raw_text,
+        profile,
+        regions=regions,
+        image_size=image_size,
+    )
     layout_choice_keys = _layout_choice_keys(regions, image_size, profile)
     speaker_markers = _marker_specs(profile, "speaker_markers")
     dialogue_markers = _marker_specs(profile, "dialogue_markers")
@@ -894,6 +1069,11 @@ def parse_screen_text(
         text_status = "ui_only"
     else:
         text_status = "empty"
+    unknown_story_lines = [
+        line
+        for line in unknown_lines
+        if _unknown_line_in_story_region(line, regions, image_size, profile)
+    ]
     return {
         "raw_text": raw_text,
         "clean_text": "\n".join(lines),
@@ -904,6 +1084,8 @@ def parse_screen_text(
         "unparsed_lines": unparsed_lines,
         "ui_lines": ui_lines,
         "unknown_lines": unknown_lines,
+        "unknown_story_lines": unknown_story_lines,
+        "ignored_lines": ignored_lines,
         "line_count": len(lines),
         "confidence": confidence,
         "screen_type": screen_type,
